@@ -63,6 +63,10 @@ beforeEach(() => {
   const seed = join(root, 'seed');
   git(root, 'init', '-q', seed);
   commit(seed, 'packages/cli/a.ts', 'v1\n', 'pkg: add A');
+  // Second (non-root) commit so the bootstrap target isn't a root commit;
+  // root tracking refs would cause `mirror pull` to include the root in
+  // the replay, which isn't what these tests are exercising.
+  commit(seed, '.dummy-non-root-marker', 'x\n', 'seed: post-root marker');
   git(seed, 'branch', '-M', 'main');
   git(seed, 'remote', 'add', 'origin', upstream);
   git(seed, 'push', '-q', 'origin', 'main');
@@ -82,8 +86,8 @@ beforeEach(() => {
   git(local, 'config', 'auto-remote.upstream.pushSyncRef', 'false');
   git(local, 'config', 'auto-remote.upstream.regeneratePaths', 'bun.lock');
 
-  const upstreamRoot = git(local, 'rev-list', '--max-parents=0', 'upstream/main');
-  git(local, 'update-ref', TRACKING, upstreamRoot);
+  // Tracking = upstream/main HEAD (post-root marker commit), NOT the root.
+  git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
 
   process.chdir(local);
   installHook('post-applypatch');
@@ -122,8 +126,7 @@ describe('regenerate on a clean range', () => {
     expect(git(local, 'show', 'HEAD:bun.lock')).toBe('local-regenerated');
     expect(git(local, 'show', 'HEAD:packages/cli/a.ts')).toBe('v2');
     // Commit includes both files.
-    const files = git(local, 'show', '--name-only', '--format=', headSha)
-      .split('\n').filter(Boolean).sort();
+    const files = git(local, 'show', '--name-only', '--format=', headSha).split('\n').filter(Boolean).sort();
     expect(files).toEqual(['bun.lock', 'packages/cli/a.ts'].sort());
   });
 
@@ -198,9 +201,7 @@ describe('regenerate safety: command must not touch paths outside regeneratePath
     git(local, 'fetch', '-q', 'upstream');
 
     // Command modifies bun.lock (in scope) AND touches a file outside regeneratePaths.
-    setRegenerateCommand(
-      "printf 'regenerated\\n' > bun.lock && printf 'leaked\\n' > packages/cli/leaked.ts",
-    );
+    setRegenerateCommand("printf 'regenerated\\n' > bun.lock && printf 'leaked\\n' > packages/cli/leaked.ts");
 
     const code = await mirrorPull({ remote: 'upstream' });
     expect(code).toBe(0); // amend happens for bun.lock, leaked stays dirty.

@@ -66,6 +66,12 @@ beforeEach(() => {
   const seed = join(root, 'seed');
   git(root, 'init', '-q', seed);
   commit(seed, 'packages/cli/a.ts', 'v1 upstream\n', 'pkg: add A');
+  // Add a second (non-root) commit so the bootstrap target isn't a root.
+  // Root bootstraps semantically mean "replay EVERYTHING from the start";
+  // these tests assume "replay starts AFTER what's tracked", which is only
+  // the behaviour for non-root tracking refs. Tests specifically exercising
+  // root-inclusive replay set tracking explicitly.
+  commit(seed, '.dummy-non-root-marker', 'x\n', 'seed: post-root marker (out of syncPaths)');
   git(seed, 'branch', '-M', 'main');
   git(seed, 'remote', 'add', 'origin', upstream);
   git(seed, 'push', '-q', 'origin', 'main');
@@ -83,9 +89,10 @@ beforeEach(() => {
   git(local, 'config', 'auto-remote.upstream.syncBranch', 'main');
   git(local, 'config', 'auto-remote.upstream.pushSyncRef', 'false');
 
-  // Bootstrap tracking ref to upstream's INITIAL commit.
-  const upstreamRoot = git(local, 'rev-list', '--max-parents=0', 'upstream/main');
-  git(local, 'update-ref', TRACKING, upstreamRoot);
+  // Bootstrap tracking ref to upstream's post-root marker commit (NOT the
+  // actual root), so `mirror pull` excludes it from the replay per standard
+  // tracking semantics.
+  git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
 
   process.chdir(local);
   installHook('post-applypatch');
