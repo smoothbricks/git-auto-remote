@@ -4,7 +4,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installHook } from '../src/lib/hooks.js';
+import { trackingRefName } from '../src/lib/mirror-state.js';
 import { mirrorPull } from '../src/commands/mirror-pull.js';
+
+const TRACKING_UPSTREAM = trackingRefName('upstream');
 
 /**
  * End-to-end tests that exercise mirror-pull against a real pair of git repos
@@ -91,7 +94,7 @@ beforeEach(() => {
 
   // 5) Bootstrap the tracking ref to upstream's current tip (content is in sync).
   const upstreamTip = git(local, 'rev-parse', 'upstream/main');
-  git(local, 'update-ref', 'refs/git-auto-remote/mirror/upstream', upstreamTip);
+  git(local, 'update-ref', TRACKING_UPSTREAM, upstreamTip);
 
   // 6) Install hooks so post-applypatch runs.
   process.chdir(local);
@@ -134,7 +137,7 @@ describe('mirror pull', () => {
     test('advances the tracking ref to the mirror tip', async () => {
       await mirrorPull({ remote: 'upstream' });
       const upstreamTip = git(local, 'rev-parse', 'upstream/main');
-      const tracking = git(local, 'rev-parse', 'refs/git-auto-remote/mirror/upstream');
+      const tracking = git(local, 'rev-parse', TRACKING_UPSTREAM);
       expect(tracking).toBe(upstreamTip);
     });
   });
@@ -250,7 +253,7 @@ describe('mirror pull with --on-partial handler', () => {
     writeFileSync(handlerScript, '#!/usr/bin/env bash\nexit 2\n');
     execFileSync('chmod', ['+x', handlerScript]);
     const headBefore = git(local, 'rev-parse', 'HEAD');
-    const trackingBefore = git(local, 'rev-parse', 'refs/git-auto-remote/mirror/upstream');
+    const trackingBefore = git(local, 'rev-parse', TRACKING_UPSTREAM);
     const code = await mirrorPull({
       remote: 'upstream',
       nonInteractive: true,
@@ -258,7 +261,7 @@ describe('mirror pull with --on-partial handler', () => {
     });
     expect(code).toBe(0);
     expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
-    const trackingAfter = git(local, 'rev-parse', 'refs/git-auto-remote/mirror/upstream');
+    const trackingAfter = git(local, 'rev-parse', TRACKING_UPSTREAM);
     expect(trackingAfter).not.toBe(trackingBefore); // advanced past the skipped commit
   });
 
@@ -333,7 +336,7 @@ describe('mirror pull with root commits on the mirror', () => {
     const localRoot = git(local, 'rev-list', '--max-parents=0', 'private');
 
     // Point tracking ref at local's root (unrelated to upstream history).
-    git(local, 'update-ref', 'refs/git-auto-remote/mirror/upstream', localRoot);
+    git(local, 'update-ref', TRACKING_UPSTREAM, localRoot);
 
     // Confirm rev-list now includes upstream's root.
     const rangeOut = git(

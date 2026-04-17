@@ -66,21 +66,39 @@ export function clearReviewPending(): void {
 
 /**
  * Tracking ref for "last commit of <remote>/<branch> that has been replayed
- * into this clone". Lives under a dedicated namespace so it never collides
- * with normal branches/tags.
+ * into this clone". Lives under a dedicated namespace, with a trailing
+ * `last-synced` component so short-name resolution (e.g. `git log <remote>`)
+ * does NOT pick up this ref as a candidate - otherwise a tracking ref named
+ * after a remote that also has a local branch of the same name (e.g. the
+ * 'private' branch on a 'private' remote) triggers "refname is ambiguous"
+ * warnings on every git invocation.
  */
 export function trackingRefName(remote: string): string {
+  return `refs/git-auto-remote/mirror/${remote}/last-synced`;
+}
+
+/** Legacy (v0.3.1 and earlier) ref location, kept so we can migrate. */
+function legacyTrackingRefName(remote: string): string {
   return `refs/git-auto-remote/mirror/${remote}`;
 }
 
 export function readTrackingRef(remote: string): string | null {
-  return gitTry('rev-parse', '--verify', '--quiet', trackingRefName(remote));
+  // Check the new location first; fall back to the legacy single-component
+  // location so existing clones continue to work until the next write.
+  const fromNew = gitTry('rev-parse', '--verify', '--quiet', trackingRefName(remote));
+  if (fromNew) return fromNew;
+  return gitTry('rev-parse', '--verify', '--quiet', legacyTrackingRefName(remote));
 }
 
 export function updateTrackingRef(remote: string, sha: string): void {
+  // Migration: if the legacy ref exists, delete it FIRST. Git treats refs as
+  // files, so `refs/X/Y/Z` cannot coexist with `refs/X/Y` as a ref - creating
+  // the new name would fail with "cannot lock ref" otherwise.
+  gitTry('update-ref', '-d', legacyTrackingRefName(remote));
   git('update-ref', trackingRefName(remote), sha);
 }
 
 export function deleteTrackingRef(remote: string): void {
   gitTry('update-ref', '-d', trackingRefName(remote));
+  gitTry('update-ref', '-d', legacyTrackingRefName(remote));
 }
