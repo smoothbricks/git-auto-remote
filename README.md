@@ -53,7 +53,10 @@ git-auto-remote mirror bootstrap public <sha-whose-tree-matches-current-packages
 
 | Config key | Meaning | Default |
 |---|---|---|
-| `fork-remote.<name>.syncPaths` | Space-separated pathspecs to include when cherry-picking. Presence makes the remote a mirror. | *required* |
+| `fork-remote.<name>.syncPaths` | Space-separated pathspecs to include when cherry-picking. Presence (either here or via `syncPathsFile`) makes the remote a mirror. | *required* |
+| `fork-remote.<name>.syncPathsFile` | Repo-relative path to a newline-separated file of sync paths. Supports `#` comments. Contents union with `syncPaths`. | *(none)* |
+| `fork-remote.<name>.excludePaths` / `.excludePathsFile` | Pathspecs that are **never** synced, even if under `syncPaths`. Useful for repo-local-only files that live in a shared directory. | *(none)* |
+| `fork-remote.<name>.reviewPaths` / `.reviewPathsFile` | Pathspecs (subset of `syncPaths`) whose changes **always** trigger a partial review pause, even when the rest of the commit is clean. | *(none)* |
 | `fork-remote.<name>.syncBranch` | Remote branch to pull from. | `<remote>/HEAD`, else `main` |
 | `fork-remote.<name>.syncTargetBranch` | Local branch that receives replayed commits. | `<remote>` |
 | `fork-remote.<name>.partialHandler` | Path to a script that resolves "partial" commits. | *(none)* |
@@ -61,13 +64,18 @@ git-auto-remote mirror bootstrap public <sha-whose-tree-matches-current-packages
 
 ### Per-commit classification
 
-Each mirror commit is classified by comparing its changed paths against `syncPaths`:
+Each mirror commit is classified by comparing its changed paths against the path config:
 
-| Changed paths | Classification | Action |
+1. Paths matching any `excludePath` are **dropped entirely** — they do not count as included or excluded.
+2. Remaining paths matching `syncPaths` are **included**.
+3. Remaining paths are **excluded** (outside the sync surface).
+4. Any included path matching a `reviewPath` flags the commit as review-required.
+
+| Situation | Classification | Action |
 |---|---|---|
-| all inside `syncPaths` | **Clean** | included in a batched `git am` run |
-| all outside `syncPaths` | **Out-of-scope** | empty patch, dropped |
-| mix of both | **Partial** | breaks the batch; applied alone; paused for review |
+| 0 included paths | **Out-of-scope** | empty patch, dropped |
+| all included, 0 excluded, 0 review-required | **Clean** | included in a batched `git am` run |
+| otherwise (any excluded OR any review-required) | **Partial** | breaks the batch; applied alone; paused for review |
 
 A batched run of clean + out-of-scope commits is applied via a single `git format-patch ... | git am --empty=drop --3way`.
 
@@ -78,11 +86,14 @@ When a partial is encountered, its in-scope changes are applied as a commit and 
 ```
 [mirror public] Partial: feat: shared lib + private glue (abc1234)
   Excluded paths: package.json, privpkgs/foo.ts
+  Review-required paths: tooling/workspace.gitconfig
   Review:    git show HEAD
   Amend:     git commit --amend    (optionally include excluded content)
   Continue:  git-auto-remote mirror continue public
   Skip:      git-auto-remote mirror skip public
 ```
+
+Either list is printed only if non-empty.
 
 - `mirror continue <remote>` — resume with whatever amendments you made
 - `mirror skip <remote>` — drop the partial (resets HEAD~1) and resume past it
