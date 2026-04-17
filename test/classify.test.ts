@@ -8,15 +8,18 @@ const spec = (
 ): PathSpec => ({ syncPaths, excludePaths, reviewPaths });
 
 describe('classify', () => {
-  describe('when no paths fall inside syncPaths', () => {
-    test('returns out-of-scope', () => {
+  describe('when no paths fall inside syncPaths or reviewPaths', () => {
+    test('returns out-of-scope for a commit with no changes', () => {
+      expect(classify([], spec(['packages']))).toEqual({ kind: 'out-of-scope' });
+    });
+
+    test('outside-only is out-of-scope: nothing for the tool to act on', () => {
+      // README.md isn't sync, exclude, or review. With no included/review content,
+      // the commit has nothing the tool can propagate - silently skip it rather
+      // than pausing the user for a commit they can't meaningfully resolve.
       expect(classify(['README.md', 'package.json'], spec(['packages']))).toEqual({
         kind: 'out-of-scope',
       });
-    });
-
-    test('returns out-of-scope for a commit with no changes', () => {
-      expect(classify([], spec(['packages']))).toEqual({ kind: 'out-of-scope' });
     });
   });
 
@@ -39,7 +42,7 @@ describe('classify', () => {
   });
 
   describe('when paths straddle syncPaths and outside', () => {
-    test('returns partial with both lists populated and empty reviewRequired', () => {
+    test('returns partial with included and outside populated, review empty', () => {
       expect(
         classify(
           ['packages/cli/foo.ts', 'privpkgs/secret.ts', 'package.json'],
@@ -48,13 +51,13 @@ describe('classify', () => {
       ).toEqual({
         kind: 'partial',
         included: ['packages/cli/foo.ts'],
-        excluded: ['privpkgs/secret.ts', 'package.json'],
-        reviewRequired: [],
+        review: [],
+        outside: ['privpkgs/secret.ts', 'package.json'],
       });
     });
   });
 
-  describe('excludePaths', () => {
+  describe('excludePaths take priority over all other buckets', () => {
     test('a path matching both sync and exclude is dropped entirely', () => {
       // tooling/sync-with-public.sh lives under 'tooling' (sync) but is
       // explicitly excluded - a commit touching only it is out-of-scope.
@@ -77,8 +80,8 @@ describe('classify', () => {
       });
     });
 
-    test('exclude does not cause partial classification (it is dropped, not excluded)', () => {
-      // Regression: an excluded path must not show up in `excluded[]`, otherwise
+    test('exclude does not cause partial classification (it is dropped, not outside)', () => {
+      // Regression: an excluded path must not show up in `outside[]`, otherwise
       // every commit touching it + a synced path would be a spurious partial.
       const result = classify(
         ['packages/x.ts', 'tooling/sync-with-public.sh'],
@@ -86,10 +89,35 @@ describe('classify', () => {
       );
       expect(result).toEqual({ kind: 'clean', included: ['packages/x.ts'] });
     });
+
+    test('exclude takes priority over reviewPaths too', () => {
+      // A path matching BOTH excludePaths and reviewPaths is dropped (exclude wins).
+      expect(
+        classify(
+          ['secret.txt'],
+          spec(['packages'], ['secret.txt'], ['secret.txt']),
+        ),
+      ).toEqual({ kind: 'out-of-scope' });
+    });
   });
 
-  describe('reviewPaths', () => {
-    test('a clean-looking commit that touches a reviewPath is classified partial', () => {
+  describe('reviewPaths is a first-class bucket', () => {
+    test('a path in reviewPaths but NOT in syncPaths still lands in review bucket', () => {
+      // bun.lock is the canonical example: user wants it reviewed but never
+      // auto-synced. It is not in syncPaths, not in excludePaths, but IS in reviewPaths.
+      expect(
+        classify(['bun.lock'], spec(['packages'], [], ['bun.lock'])),
+      ).toEqual({
+        kind: 'partial',
+        included: [],
+        review: ['bun.lock'],
+        outside: [],
+      });
+    });
+
+    test('reviewPaths takes priority over syncPaths', () => {
+      // tooling/workspace.gitconfig is both under syncPaths (tooling) and reviewPaths.
+      // It goes to `review`, not `included`, so HEAD does not get it auto-applied.
       expect(
         classify(
           ['tooling/workspace.gitconfig'],
@@ -97,43 +125,62 @@ describe('classify', () => {
         ),
       ).toEqual({
         kind: 'partial',
-        included: ['tooling/workspace.gitconfig'],
-        excluded: [],
-        reviewRequired: ['tooling/workspace.gitconfig'],
+        included: [],
+        review: ['tooling/workspace.gitconfig'],
+        outside: [],
       });
     });
 
-    test('reviewPath contributions show up in reviewRequired list', () => {
+    test('mixed commit: sync + review content produces included AND review', () => {
       const result = classify(
         ['packages/a.ts', 'tooling/workspace.gitconfig'],
         spec(['packages', 'tooling'], [], ['tooling/workspace.gitconfig']),
       );
       expect(result).toEqual({
         kind: 'partial',
-        included: ['packages/a.ts', 'tooling/workspace.gitconfig'],
-        excluded: [],
-        reviewRequired: ['tooling/workspace.gitconfig'],
+        included: ['packages/a.ts'],
+        review: ['tooling/workspace.gitconfig'],
+        outside: [],
       });
     });
 
-    test('reviewRequired can coexist with excluded paths in one commit', () => {
+    test('review can coexist with outside in the same commit', () => {
       expect(
         classify(
-          ['packages/a.ts', 'tooling/workspace.gitconfig', 'privpkgs/x.ts'],
-          spec(['packages', 'tooling'], [], ['tooling/workspace.gitconfig']),
+          ['packages/a.ts', 'bun.lock', 'privpkgs/x.ts'],
+          spec(['packages'], [], ['bun.lock']),
         ),
       ).toEqual({
         kind: 'partial',
-        included: ['packages/a.ts', 'tooling/workspace.gitconfig'],
-        excluded: ['privpkgs/x.ts'],
-        reviewRequired: ['tooling/workspace.gitconfig'],
+        included: ['packages/a.ts'],
+        review: ['bun.lock'],
+        outside: ['privpkgs/x.ts'],
+      });
+    });
+
+    test('pure review-only commit: included empty, review non-empty (sub-case C)', () => {
+      // Canonical pure-review-only case: commit touches only reviewPaths and
+      // no syncPaths. Classification is partial; the tool will pause with the
+      // review diff in worktree but no HEAD commit made until the user stages.
+      expect(
+        classify(['bun.lock', 'package.json'], spec(['packages'], [], ['bun.lock', 'package.json'])),
+      ).toEqual({
+        kind: 'partial',
+        included: [],
+        review: ['bun.lock', 'package.json'],
+        outside: [],
       });
     });
   });
 
   describe('prefix matching precision', () => {
     test('does not false-match partial directory names', () => {
-      expect(classify(['packages-rc/x.ts'], spec(['packages']))).toEqual({ kind: 'out-of-scope' });
+      // 'packages-rc/x.ts' does not start with 'packages/' and is not 'packages'.
+      // It lands in `outside`, and with no included/review content the commit
+      // is out-of-scope.
+      expect(classify(['packages-rc/x.ts'], spec(['packages']))).toEqual({
+        kind: 'out-of-scope',
+      });
     });
 
     test('supports multiple syncPaths', () => {
@@ -142,8 +189,8 @@ describe('classify', () => {
       ).toEqual({
         kind: 'partial',
         included: ['packages/cli/a.ts', 'tooling/b.sh'],
-        excluded: ['README.md'],
-        reviewRequired: [],
+        review: [],
+        outside: ['README.md'],
       });
     });
 
@@ -173,8 +220,8 @@ describe('segment', () => {
     classification: {
       kind: 'partial',
       included: ['packages/x.ts'],
-      excluded: ['README.md'],
-      reviewRequired: [],
+      review: [],
+      outside: ['README.md'],
     },
   });
 

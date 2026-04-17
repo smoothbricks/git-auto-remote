@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { detect } from './commands/detect.js';
-import { mirrorAmContinue } from './commands/mirror-am-continue.js';
-import { mirrorAmSkip } from './commands/mirror-am-skip.js';
 import { mirrorBootstrap } from './commands/mirror-bootstrap.js';
 import { mirrorContinue } from './commands/mirror-continue.js';
 import { mirrorList } from './commands/mirror-list.js';
@@ -31,10 +29,8 @@ Mirror commands (cherry-pick from a remote with disjoint history):
   mirror bootstrap <remote> <sha> [--force]     Initialize tracking ref
   mirror pull [<remote>] [--non-interactive]    Sync new mirror commits
                            [--on-partial <cmd>] Handler for partial commits
-  mirror continue [<remote>]                    Resume after partial review
-  mirror skip [<remote>]                        Discard partial, advance, resume
-  mirror am-continue [<remote>]                 Wrap 'git am --continue' + auto-resume
-  mirror am-skip [<remote>]                     Wrap 'git am --skip' + advance ref + auto-resume
+  mirror continue [<remote>]                    Resume from any sync pause
+  mirror skip [<remote>]                        Skip the paused commit, resume
 
 Hook entry points (invoked by installed hooks; not meant for manual use):
   post-checkout <prev> <new> <flag>
@@ -88,13 +84,15 @@ async function main(): Promise<number> {
           onPartial: typeof values['on-partial'] === 'string' ? values['on-partial'] : null,
         });
       case 'continue':
-        return mirrorContinue(subArgs[0]);
+        return await mirrorContinue(subArgs[0]);
       case 'skip':
-        return mirrorSkip(subArgs[0]);
+        return await mirrorSkip(subArgs[0]);
       case 'am-continue':
-        return await mirrorAmContinue(subArgs[0]);
       case 'am-skip':
-        return await mirrorAmSkip(subArgs[0]);
+        console.error(
+          `'mirror ${sub}' was removed in v0.4.0. Use 'mirror continue' / 'mirror skip' instead - they now handle am-conflict, review-pause, and pure-review-pause uniformly.`,
+        );
+        return 1;
       default:
         console.error(`Unknown mirror subcommand: ${sub ?? '(none)'}`);
         console.error(USAGE);

@@ -5,11 +5,14 @@ import type { ClassifiedCommit } from './classify.js';
 /**
  * Apply a range of clean/out-of-scope commits via `git format-patch | git am`.
  *
- *   git format-patch --stdout <sha>^..<sha> -- <syncPaths> :(exclude)...  |  git am --empty=drop --3way
+ *   git format-patch --stdout <sha>^..<sha> -- <syncPaths> :(exclude)<excludePaths> :(exclude)<reviewPaths>
+ *      |  git am --empty=drop --3way
  *
  * Out-of-scope commits produce empty patches and are dropped by `--empty=drop`.
- * Paths matching `excludePaths` are filtered out at the patch-generation stage
- * via git's `:(exclude)` pathspec magic.
+ * Paths matching `excludePaths` OR `reviewPaths` are filtered out at patch-
+ * generation time via git's `:(exclude)` pathspec magic so HEAD contains ONLY
+ * the `included` bucket. ReviewPaths are applied to the worktree separately
+ * via `applyReviewToWorktree`.
  *
  * IMPORTANT - why the range form `<sha>^..<sha>` rather than `-1 <sha>`:
  * `git format-patch -1 <sha> -- <pathspec>` walks BACKWARD through ancestors
@@ -35,10 +38,15 @@ export function applyRange(
   commits: readonly ClassifiedCommit[],
   syncPaths: readonly string[],
   excludePaths: readonly string[] = [],
+  reviewPaths: readonly string[] = [],
 ): 'applied' | 'conflict' | 'error' {
   if (commits.length === 0) return 'applied';
 
-  const pathspec = [...syncPaths, ...excludePaths.map((p) => `:(exclude)${p}`)];
+  const pathspec = [
+    ...syncPaths,
+    ...excludePaths.map((p) => `:(exclude)${p}`),
+    ...reviewPaths.map((p) => `:(exclude)${p}`),
+  ];
 
   const chunks: Buffer[] = [];
   for (const c of commits) {
@@ -100,17 +108,88 @@ function formatPatchExact(sha: string, pathspec: readonly string[]): Buffer | nu
   return buf;
 }
 
-/** Apply a single partial commit's in-scope changes. */
+/** Apply a single partial commit's in-scope (`included`) changes to HEAD. */
 export function applyPartial(
   sha: string,
   syncPaths: readonly string[],
   excludePaths: readonly string[] = [],
+  reviewPaths: readonly string[] = [],
 ): 'applied' | 'conflict' | 'error' {
   return applyRange(
     [{ sha, classification: { kind: 'clean', included: [] } }],
     syncPaths,
     excludePaths,
+    reviewPaths,
   );
+}
+
+/**
+ * Apply the `review`-bucket subset of a partial commit to the working tree as
+ * UNSTAGED changes. Invoked after `applyPartial` lands the `included` subset
+ * into HEAD, before pausing for human review. User can then `git add -p` /
+ * `git restore` / `git commit --amend --no-edit` interactively.
+ *
+ * Conflict resolution follows `git apply --3way` semantics: if a review-path
+ * hunk cannot be applied cleanly, conflict markers are left in the file and
+ * the user resolves them before `mirror continue`.
+ *
+ * The empty-tree fallback for root commits uses the well-known empty-tree SHA
+ * (`4b825dc642cb6eb9a060e54bf8d69288fbee4904`).
+ *
+ * @returns
+ *   'applied'  - diff applied cleanly, or was empty (nothing to do)
+ *   'conflict' - some hunks left conflict markers in worktree files
+ *   'error'    - git reported a failure we couldn't classify as conflict
+ */
+export function applyReviewToWorktree(
+  sha: string,
+  reviewPaths: readonly string[],
+  excludePaths: readonly string[] = [],
+): 'applied' | 'conflict' | 'error' {
+  if (reviewPaths.length === 0) return 'applied';
+
+  const pathspec = [...reviewPaths, ...excludePaths.map((p) => `:(exclude)${p}`)];
+
+  const hasParent = gitTry('rev-parse', '--verify', '--quiet', `${sha}^`) !== null;
+  const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+  const diffArgs = hasParent
+    ? ['diff', '--binary', `${sha}^..${sha}`, '--', ...pathspec]
+    : ['diff', '--binary', EMPTY_TREE, sha, '--', ...pathspec];
+
+  let diffBuf: Buffer;
+  try {
+    diffBuf = execFileSync('git', diffArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {
+    return 'error';
+  }
+
+  if (diffBuf.length === 0) return 'applied'; // nothing in scope
+
+  // `git apply --3way` writes to the worktree AND the index (--3way implies
+  // --index). We want review content UNSTAGED so `mirror continue` only
+  // amends when the user explicitly `git add`s - so we unstage everything
+  // `--3way` just touched. Use execFileSync with the list of pathspecs to
+  // be precise.
+  const apply = spawnSync('git', ['apply', '--3way'], {
+    input: diffBuf,
+    stdio: ['pipe', 'inherit', 'inherit'],
+  });
+  const applyStatus = apply.status;
+
+  // Unstage any paths --3way may have staged. Use `git reset HEAD -- <paths>`
+  // (rather than the reviewPaths pathspecs, which could be directories) by
+  // discovering what's actually staged and resetting those entries. Safe even
+  // if there's nothing staged.
+  const stagedOut = gitTry('diff', '--cached', '--name-only');
+  if (stagedOut) {
+    const stagedPaths = stagedOut.split('\n').filter((p) => p.length > 0);
+    if (stagedPaths.length > 0) {
+      gitTry('reset', 'HEAD', '--', ...stagedPaths);
+    }
+  }
+
+  if (applyStatus === 0) return 'applied';
+  return 'conflict';
 }
 
 /** Pretty-print "Applying: <subject>" lines, mimicking `git am`'s own output. */
