@@ -121,10 +121,27 @@ afterEach(() => {
 
 describe('pause message format (v0.5.5 regression guard)', () => {
   test('partial-pause header + footer match the consistent format contract', async () => {
-    // Push a commit with both included AND outside-scope content so it
-    // classifies as partial.
+    // Push a commit with included + review + outside content. Review is
+    // REQUIRED for the pause path (v0.5.8+: empty-review partials auto-apply
+    // with a concise one-line note, never reach the multi-line pause
+    // header+footer that this test locks in).
     const seed = join(root, 'seed');
+    // Seed review baseline on both sides so --3way can overlay.
+    mkdirSync(join(seed, 'tooling'), { recursive: true });
+    writeFileSync(join(seed, 'tooling/reviewed.conf'), 'v0\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'seed: review baseline');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+    mkdirSync(join(local, 'tooling'), { recursive: true });
+    writeFileSync(join(local, 'tooling/reviewed.conf'), 'v0\n');
+    git(local, 'add', '-A');
+    git(local, 'commit', '-q', '-m', 'local: seed review baseline');
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'tooling/reviewed.conf');
+
     writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream\n');
+    writeFileSync(join(seed, 'tooling/reviewed.conf'), 'v1\n'); // review
     writeFileSync(join(seed, 'package.json'), '{"name":"outside"}\n'); // outside
     git(seed, 'add', '-A');
     git(seed, 'commit', '-q', '-m', 'feat: bump A and touch outside');
@@ -138,6 +155,8 @@ describe('pause message format (v0.5.5 regression guard)', () => {
     // --- Header contract ---
     // `[mirror upstream] Partial:  <sha8>  <subject>` (two spaces around sha).
     expect(output).toContain(`[mirror upstream] Partial:  ${shortSha}  feat: bump A and touch outside`);
+    // Review bucket line uses the right label.
+    expect(output).toContain('Review (in worktree, unstaged): tooling/reviewed.conf');
     // Outside bucket line uses the right label.
     expect(output).toContain('Outside sync scope (dropped):   package.json');
 

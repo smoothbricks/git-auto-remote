@@ -170,25 +170,153 @@ describe('mirror pull', () => {
       git(local, 'fetch', '-q', 'upstream');
     });
 
-    test('--non-interactive stops with exit 2 and does not commit the partial', async () => {
+    test('--non-interactive with empty review + no handler: auto-applies (no stop)', async () => {
+      // v0.5.8: review bucket is empty (no reviewPaths configured, and the
+      // README is 'outside', not 'review'). A partial with review=[] has
+      // nothing for a human to decide, so it auto-applies in all modes -
+      // including --non-interactive - rather than stopping.
       const headBefore = git(local, 'rev-parse', 'HEAD');
       const code = await mirrorPull({
         remote: 'upstream',
         nonInteractive: true,
       });
-      expect(code).toBe(2);
-      // Partial was applied then reset, so HEAD is unchanged.
-      expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+      expect(code).toBe(0);
+      // Commit landed.
+      expect(git(local, 'rev-parse', 'HEAD')).not.toBe(headBefore);
+      // README (outside) must NOT have been pulled in.
+      const readmeLocal = join(local, 'README.md');
+      expect(existsSync(readmeLocal)).toBe(false);
+      // No review-pending marker.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
     });
 
-    test('interactive mode pauses with the partial committed and a review marker', async () => {
+    test('interactive mode auto-applies when review bucket is empty (no pointless pause)', async () => {
+      // v0.5.8 FIX: a partial commit with review=[] (only outside + included,
+      // or outside + included + regenerate) has nothing for a human to decide.
+      // Pre-v0.5.8 incorrectly paused with a "review required" marker, forcing
+      // the user to type `mirror continue` for no reason.
       const headBefore = git(local, 'rev-parse', 'HEAD');
       const code = await mirrorPull({ remote: 'upstream' });
       expect(code).toBe(0);
-      // Partial IS applied (user can amend).
+      // Commit landed (included subset applied via git am).
       expect(git(local, 'rev-parse', 'HEAD')).not.toBe(headBefore);
-      // Review-pending file is present.
-      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
+      // README (outside) must NOT have been pulled in.
+      expect(existsSync(join(local, 'README.md'))).toBe(false);
+      // CRITICAL: NO review-pending marker must be written. Pre-v0.5.8 wrote
+      // one here, causing the bogus pause.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      // Tracking ref advanced to source SHA.
+      const upstreamTip = git(local, 'rev-parse', 'upstream/main');
+      const tracking = git(local, 'rev-parse', TRACKING_UPSTREAM);
+      expect(tracking).toBe(upstreamTip);
+    });
+  });
+
+  describe('partial with empty review + regenerate (Conloca 56472eb1 shape)', () => {
+    /**
+     * EXACT SHAPE of the v0.5.7 Conloca bug: a partial commit that touches
+     *   included (packages/*)   - applied via git am
+     *   regenerate (bun.lock)   - regenerated locally + amended into HEAD
+     *   outside (privpkgs/*)    - dropped from the patch
+     *   review ([])             - EMPTY
+     *
+     * Pre-v0.5.8 this paused with a bogus "review required" marker. v0.5.8
+     * must auto-apply: included lands, regenerate amends HEAD, outside is
+     * dropped, no pause, no marker, tracking advances.
+     */
+    beforeEach(() => {
+      // Seed bun.lock on both sides so it's a modification (not add) - the
+      // realistic Conloca state.
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v0\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'seed: bun.lock v0');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      git(local, 'update-ref', TRACKING_UPSTREAM, git(local, 'rev-parse', 'upstream/main'));
+      // Local has a different bun.lock (simulates prior local regeneration).
+      writeFileSync(join(local, 'bun.lock'), 'local-regen\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'local: seed bun.lock');
+
+      // Configure regenerate + excludePaths (outside is implicit by
+      // not matching anything).
+      git(local, 'config', 'auto-remote.upstream.regeneratePaths', 'bun.lock');
+      // Deterministic, git-independent regen so we don't depend on devenv/bun.
+      git(local, 'config', 'auto-remote.upstream.regenerateCommand', "printf 'regenerated\\n' > bun.lock");
+
+      // Upstream commit: touches included + regenerate + outside, no review.
+      writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A v2-Conloca\n');
+      writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v1\n');
+      mkdirSync(join(seed, 'privpkgs/tldraw-app'), { recursive: true });
+      writeFileSync(join(seed, 'privpkgs/tldraw-app/package.json'), '{"name":"td","v":"1"}\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'Refactor: cms-spa component structure (#5)');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+    });
+
+    test('auto-applies without pausing; review-pending marker is NOT written', async () => {
+      const headBefore = git(local, 'rev-parse', 'HEAD');
+      const code = await mirrorPull({ remote: 'upstream' });
+      expect(code).toBe(0);
+      // Included landed.
+      expect(git(local, 'rev-parse', 'HEAD')).not.toBe(headBefore);
+      expect(readFileSync(join(local, 'packages/cli/a.ts'), 'utf8')).toBe('pkg A v2-Conloca\n');
+      // Regenerate: HEAD has OUR regenerated bun.lock, not source's 'upstream-lock v1'.
+      expect(readFileSync(join(local, 'bun.lock'), 'utf8')).toBe('regenerated\n');
+      // Outside dropped.
+      expect(existsSync(join(local, 'privpkgs/tldraw-app/package.json'))).toBe(false);
+      // No pause.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      // Tracking advanced.
+      const upstreamTip = git(local, 'rev-parse', 'upstream/main');
+      expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(upstreamTip);
+    });
+
+    test('emits a one-line "Partial auto-applied" note listing regenerate + outside paths', async () => {
+      // Capture console.error to verify user-facing messaging.
+      const originalError = console.error;
+      let captured = '';
+      console.error = (...args: unknown[]): void => {
+        captured += args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n';
+      };
+      try {
+        const code = await mirrorPull({ remote: 'upstream' });
+        expect(code).toBe(0);
+      } finally {
+        console.error = originalError;
+      }
+      // One-line header in the auto-apply style.
+      expect(captured).toMatch(/Partial auto-applied:\s+[0-9a-f]{8}\s+Refactor: cms-spa/);
+      // Lists the regenerated + outside paths so user has visibility.
+      expect(captured).toContain('Regenerated:');
+      expect(captured).toContain('bun.lock');
+      expect(captured).toContain('Outside (dropped):');
+      expect(captured).toContain('privpkgs/tldraw-app/package.json');
+      // MUST NOT contain the pre-v0.5.8 full-header-and-footer message.
+      expect(captured).not.toContain('Review (in worktree, unstaged)');
+      expect(captured).not.toContain('Continue: git-auto-remote mirror continue');
+    });
+
+    test('handler is NOT invoked when review is empty (even if configured)', async () => {
+      // Handler creates a side-effect file if invoked. Assert it was NOT created.
+      const handlerScript = join(root, 'handler-must-not-fire.sh');
+      const sideEffect = join(root, 'handler-fired.marker');
+      writeFileSync(handlerScript, `#!/usr/bin/env bash\ntouch ${JSON.stringify(sideEffect)}\nexit 0\n`);
+      execFileSync('chmod', ['+x', handlerScript]);
+
+      const code = await mirrorPull({
+        remote: 'upstream',
+        onPartial: handlerScript,
+      });
+      expect(code).toBe(0);
+      // Handler's outcomes (resolved/skipped/punted/dirty-tree) all presuppose
+      // review content to adjudicate. With review=[] there's nothing for the
+      // handler to decide, so it must be skipped entirely.
+      expect(existsSync(sideEffect)).toBe(false);
+      // And the commit still auto-applies.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
     });
   });
 
@@ -224,12 +352,34 @@ describe('mirror pull with --on-partial handler', () => {
   let handlerScript: string;
 
   beforeEach(() => {
-    // A partial commit on the mirror for all tests in this block.
+    // A partial commit that touches included + review + outside. Review
+    // content is REQUIRED for the handler path to engage (v0.5.8+: handler
+    // is skipped when review bucket is empty because its outcomes all
+    // presuppose review content to adjudicate).
     const seed = join(root, 'seed');
+    // Seed the review file on both sides so it's a modification.
+    mkdirSync(join(seed, 'tooling'), { recursive: true });
+    writeFileSync(join(seed, 'tooling/reviewed.conf'), 'v0\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'seed: reviewed.conf');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    git(local, 'update-ref', TRACKING_UPSTREAM, git(local, 'rev-parse', 'upstream/main'));
+    // Local has the same baseline so --3way can apply.
+    mkdirSync(join(local, 'tooling'), { recursive: true });
+    writeFileSync(join(local, 'tooling/reviewed.conf'), 'v0\n');
+    git(local, 'add', '-A');
+    git(local, 'commit', '-q', '-m', 'local: seed reviewed.conf');
+
+    // Configure reviewPaths.
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'tooling/reviewed.conf');
+
+    // The partial commit: included + review + outside.
     writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A v2\n');
+    writeFileSync(join(seed, 'tooling/reviewed.conf'), 'v1\n');
     writeFileSync(join(seed, 'README.md'), 'Mixed readme\n');
     git(seed, 'add', '-A');
-    git(seed, 'commit', '-q', '-m', 'feat: bump A and readme');
+    git(seed, 'commit', '-q', '-m', 'feat: bump A + review + readme');
     git(seed, 'push', '-q', 'origin', 'main');
     git(local, 'fetch', '-q', 'upstream');
 
@@ -237,7 +387,13 @@ describe('mirror pull with --on-partial handler', () => {
   });
 
   test('handler exit 0 = continue: the applied subset stays, no review pending', async () => {
-    writeFileSync(handlerScript, '#!/usr/bin/env bash\nexit 0\n');
+    // Handler semantics (resolved = exit 0): handler is responsible for
+    // leaving the worktree clean. Discard the unstaged review overlay to
+    // simulate "I accept the included subset, reject the review hunks".
+    writeFileSync(
+      handlerScript,
+      '#!/usr/bin/env bash\ngit restore tooling/reviewed.conf 2>/dev/null || true\nexit 0\n',
+    );
     execFileSync('chmod', ['+x', handlerScript]);
     const headBefore = git(local, 'rev-parse', 'HEAD');
     const code = await mirrorPull({

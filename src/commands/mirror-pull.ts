@@ -290,11 +290,17 @@ async function handlePartial(
   const subject = commitSubject(commit.sha);
   const handler = options.onPartial ?? mirror.partialHandler;
 
-  // In --non-interactive mode without a handler, do NOT apply. Advancing the
-  // ref here would silently lose the commit on the next run; leaving both HEAD
-  // and the tracking ref untouched means CI will surface the same partial until
-  // a human handles it.
-  if (options.nonInteractive && !handler) {
+  // In --non-interactive mode without a handler, do NOT apply - leaving both
+  // HEAD and the tracking ref untouched means CI will surface the same
+  // partial until a human handles it.
+  //
+  // EXCEPTION (v0.5.8): when review bucket is empty, a "partial" commit has
+  // nothing for a human to decide - included can land via `git am`,
+  // regenerate can amend, outside is dropped. Stopping here would force a
+  // human round-trip for no reason. Fall through to auto-apply (the
+  // review=[] short-circuit after the `git am` step handles the actual
+  // auto-apply and emits the one-line note).
+  if (options.nonInteractive && !handler && review.length > 0) {
     printPartialHeader(mirror.remote, subject, commit.sha, review, regenerate, outside);
     return { kind: 'stopped' };
   }
@@ -308,7 +314,15 @@ async function handlePartial(
   }
 
   // ----- Sub-case A/B: included non-empty. Apply included subset via `git am`. -----
-  printPartialHeader(mirror.remote, subject, commit.sha, review, regenerate, outside);
+  // Header is printed AFTER we know whether we'll pause. If the commit will
+  // auto-apply (empty review - see below), we emit the concise one-line
+  // auto-apply note instead of the full multi-line Partial: header+footer.
+  // Printing the full header eagerly here would produce confusing dual
+  // messaging for the auto-apply case.
+  const willPause = review.length > 0;
+  if (willPause) {
+    printPartialHeader(mirror.remote, subject, commit.sha, review, regenerate, outside);
+  }
 
   setMirrorInProgress(mirror.remote);
   const applyResult = applyPartial(
@@ -362,6 +376,30 @@ async function handlePartial(
   // shows only the review content as unstaged.
   if (mirror.regenerateCommand && mirror.regeneratePaths.length > 0 && regenerate.length > 0) {
     runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote);
+  }
+
+  // v0.5.8: empty review bucket = nothing for a human (or handler) to decide.
+  //   - `included` already landed in HEAD via `git am` with preserved metadata.
+  //   - `regenerate` already amended into HEAD (if any regeneratePaths matched).
+  //   - `outside` was dropped from the patch by construction.
+  // Pausing here would force the user to `mirror continue` with zero staging
+  // work. Handler invocation is equally pointless: its outcomes (resolved,
+  // skipped, punted, dirty-tree) all presuppose review content to adjudicate.
+  // Users who want a "partial was auto-applied" hook regardless should use
+  // post-applypatch.
+  //
+  // Emit a concise one-line note (matches `printPartialHeader` format) so the
+  // user has visibility into what was dropped / regenerated without the full
+  // multi-line pause framing.
+  if (review.length === 0) {
+    console.error(`[mirror ${mirror.remote}] Partial auto-applied: ${commit.sha.slice(0, 8)}  ${subject}`);
+    if (regenerate.length > 0) {
+      console.error(`  Regenerated: ${regenerate.join(', ')}`);
+    }
+    if (outside.length > 0) {
+      console.error(`  Outside (dropped): ${outside.join(', ')}`);
+    }
+    return { kind: 'applied' };
   }
 
   // If a handler is configured: worktree gets review overlay first, then handler runs.
