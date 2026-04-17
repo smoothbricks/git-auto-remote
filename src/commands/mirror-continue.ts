@@ -83,11 +83,21 @@ async function continueAm(remoteArg?: string): Promise<number> {
     return 1;
   }
 
-  // If am stopped structurally (not via 3-way conflict) - no merge markers
-  // AND no staged content to commit - `git am --continue` would fail with
-  // "no changes - did you forget to use 'git add'?" which misleads the user
-  // into hunting for nonexistent conflicts. Redirect them to `mirror skip`.
-  if (!hasUnresolvedMergeConflicts() && !hasStagedChanges()) {
+  // Pre-check A: unresolved merge conflicts present. `git am --continue`
+  // would refuse with its own error; surface a cleaner message pointing at
+  // the resolution workflow rather than running git and seeing its output.
+  if (hasUnresolvedMergeConflicts()) {
+    console.error(`[mirror ${remote}] There are still unresolved merge conflicts.`);
+    console.error(`[mirror ${remote}]   Edit the files, 'git add' the resolutions, then re-run 'mirror continue'.`);
+    console.error(`[mirror ${remote}]   Check conflicted files:  git diff --name-only --diff-filter=U`);
+    return 1;
+  }
+
+  // Pre-check B: am stopped structurally (no merge markers, nothing staged).
+  // `git am --continue` would fail with "no changes - did you forget to use
+  // 'git add'?" which misleads the user into hunting for nonexistent
+  // conflicts. Redirect them to `mirror skip`.
+  if (!hasStagedChanges()) {
     console.error(`[mirror ${remote}] 'git am' is in progress but there are no conflict markers to resolve`);
     console.error(`[mirror ${remote}]   and nothing is staged. The patch likely references content missing`);
     console.error(`[mirror ${remote}]   from HEAD (rename source, mode change, etc.). Recover with:`);
@@ -138,12 +148,16 @@ async function postAmTransition(remote: string, reviewState: ReviewPendingState)
   const mirror = getMirrorConfig(remote);
   const excludePaths = mirror?.excludePaths ?? [];
   const overlay = applyReviewToWorktree(reviewState.sourceSha, reviewState.review, excludePaths);
-  if (overlay === 'conflict') {
-    console.error(`[mirror ${remote}]   (some review-path hunks left conflict markers; resolve before continuing)`);
-  } else if (overlay === 'error') {
+  if (overlay === 'error') {
     console.error(
       `[mirror ${remote}]   (failed to overlay review paths; inspect with: git show ${reviewState.sourceSha.slice(0, 8)})`,
     );
+  } else if (overlay === 'conflict') {
+    console.error(`[mirror ${remote}]   (some review-path hunks left conflict markers; resolve before continuing)`);
+  } else if (overlay === 'fallback') {
+    console.error(`[mirror ${remote}]   (review-path diff did not apply cleanly - worktree now has source's`);
+    console.error(`[mirror ${remote}]    version verbatim. 'git diff' shows the FULL local->source delta for`);
+    console.error(`[mirror ${remote}]    each review path, not just this commit's change. Stage what you want.)`);
   }
   setReviewPending({ ...reviewState, phase: 'review-pause' });
   console.error(`[mirror ${remote}] Partial: ${reviewState.subject} (${reviewState.sourceSha.slice(0, 8)})`);

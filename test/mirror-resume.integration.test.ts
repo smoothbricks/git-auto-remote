@@ -236,6 +236,45 @@ describe('sub-case A: git am conflict', () => {
       expect(git(local, 'rev-parse', TRACKING)).toBe(renameSha);
     });
   });
+
+  /**
+   * Regression (v0.5.2): `mirror continue` called with unresolved merge
+   * conflicts (UU entries) should NOT invoke `git am --continue` - it would
+   * fail with git's own terse error. Instead, short-circuit with a clear
+   * pointer to the resolution workflow.
+   */
+  describe('mirror continue pre-check: unresolved merge conflicts', () => {
+    function pushConflictingPatch(): string {
+      // Diverge local + upstream on the same file so --3way leaves markers.
+      writeFileSync(join(local, 'packages/cli/a.ts'), 'v1 local different\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'local: diverge');
+
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'up: bump A');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      return git(seed, 'rev-parse', 'HEAD');
+    }
+
+    test('mirror continue returns 1 without invoking git am --continue when UU entries exist', async () => {
+      pushConflictingPatch();
+      await mirrorPull({ remote: 'upstream' });
+      // UU entry must be present.
+      const statusBefore = git(local, 'status', '--porcelain');
+      expect(statusBefore).toMatch(/^UU /m);
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(1);
+      // am is still in progress (continue short-circuited without running it).
+      expect(existsSync(join(local, '.git/rebase-apply'))).toBe(true);
+      // Still has the UU entry - continue didn't try anything.
+      const statusAfter = git(local, 'status', '--porcelain');
+      expect(statusAfter).toMatch(/^UU /m);
+    });
+  });
 });
 
 describe('sub-case B: review-pause (mixed partial)', () => {
