@@ -9,6 +9,7 @@ import { mirrorPull } from './commands/mirror-pull.js';
 import { mirrorSkip } from './commands/mirror-skip.js';
 import { mirrorSource } from './commands/mirror-source.js';
 import { mirrorStatus } from './commands/mirror-status.js';
+import { splitPassthroughArgs } from './lib/cli-args.js';
 import { postApplypatch } from './commands/post-applypatch.js';
 import { postCheckout } from './commands/post-checkout.js';
 import { postMerge } from './commands/post-merge.js';
@@ -33,9 +34,10 @@ Mirror commands (cherry-pick from a remote with disjoint history):
                            [--on-partial <cmd>] Handler for partial commits
   mirror continue [<remote>]                    Resume from any sync pause
   mirror skip [<remote>]                        Skip the paused commit, resume
-  mirror diff [<remote>] [--include-excluded]   Source-vs-HEAD diff during pause,
-              [--raw] [git-diff-args...]        scoped to the sync domain
-  mirror source [<remote>] [git-show-args...]   'git show' the current pause's source
+  mirror diff [<remote>] [--raw] [git-diff-args]  Source-vs-HEAD diff during a pause,
+                                                  scoped to paths THIS commit touched
+                                                  in review/regenerate/outside buckets
+  mirror source [<remote>] [git-show-args]        'git show' the current pause's source
 
 Hook entry points (invoked by installed hooks; not meant for manual use):
   post-checkout <prev> <new> <flag>
@@ -48,8 +50,21 @@ Options:
 `;
 
 async function main(): Promise<number> {
+  // Special-case `mirror diff` and `mirror source` subcommands BEFORE parseArgs
+  // strips any unrecognized flags (node's parseArgs moves `--stat`, `--raw`,
+  // etc. into `values` as booleans rather than leaving them in positionals
+  // even with strict:false). For these subcommands we want to forward all
+  // trailing args verbatim to git-diff / git-show respectively, so we split
+  // them off here and dispatch directly.
+  const raw = process.argv.slice(2);
+  if (raw[0] === 'mirror' && (raw[1] === 'diff' || raw[1] === 'source')) {
+    const sub = raw[1];
+    const { remote, extraArgs } = splitPassthroughArgs(raw.slice(2));
+    return sub === 'diff' ? mirrorDiff(remote, extraArgs) : mirrorSource(remote, extraArgs);
+  }
+
   const { values, positionals } = parseArgs({
-    args: process.argv.slice(2),
+    args: raw,
     options: {
       help: { type: 'boolean', short: 'h' },
       quiet: { type: 'boolean' },
@@ -92,18 +107,13 @@ async function main(): Promise<number> {
         return await mirrorContinue(subArgs[0]);
       case 'skip':
         return await mirrorSkip(subArgs[0]);
-      case 'diff': {
-        // First subArg may be a remote name OR a flag/passthrough arg. If it
-        // starts with '-' treat all subArgs as flags/passthrough.
-        const first = subArgs[0];
-        const hasRemote = first && !first.startsWith('-');
-        return mirrorDiff(hasRemote ? first : undefined, hasRemote ? subArgs.slice(1) : subArgs);
-      }
-      case 'source': {
-        const first = subArgs[0];
-        const hasRemote = first && !first.startsWith('-');
-        return mirrorSource(hasRemote ? first : undefined, hasRemote ? subArgs.slice(1) : subArgs);
-      }
+      case 'diff':
+      case 'source':
+        // Unreachable: these are special-cased at the top of main() to
+        // bypass parseArgs and preserve their passthrough args. Fall
+        // through defensively if something routes here.
+        console.error(`[git-auto-remote] internal: 'mirror ${sub}' routed through parseArgs path`);
+        return 1;
       case 'am-continue':
       case 'am-skip':
         console.error(

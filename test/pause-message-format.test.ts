@@ -144,13 +144,21 @@ describe('pause message format (v0.5.5 regression guard)', () => {
     // --- Footer contract ---
     // Source recap mid-footer (matches header's sha+subject).
     expect(output).toContain(`Source:   ${shortSha}  feat: bump A and touch outside`);
-    // Subcommand-based Dropped and Show lines (NOT raw git diff/git show).
-    expect(output).toContain('Dropped:  git-auto-remote mirror diff upstream');
-    expect(output).toContain('Show:     git-auto-remote mirror source upstream');
-    // Resume commands.
-    expect(output).toContain('Continue: git-auto-remote mirror continue upstream');
-    expect(output).toContain('Skip:     git-auto-remote mirror skip upstream');
-    // Obsolete hints are GONE.
+    // Subcommand-based Diff and Show lines (NOT raw git diff/git show).
+    expect(output).toContain('Diff:     git-auto-remote mirror diff');
+    expect(output).toContain('Show:     git-auto-remote mirror source');
+    // Resume commands - v0.5.6: remote arg DROPPED from displayed commands
+    // since during a pause only one remote can be paused at a time.
+    expect(output).toContain('Continue: git-auto-remote mirror continue');
+    expect(output).toContain('Skip:     git-auto-remote mirror skip');
+    // v0.5.6 regression guards: the displayed commands MUST NOT include the
+    // remote name as a positional (only one active pause -> remote is
+    // unambiguous, forcing the user to type it was noise).
+    expect(output).not.toMatch(/mirror continue upstream/);
+    expect(output).not.toMatch(/mirror skip upstream/);
+    expect(output).not.toMatch(/mirror diff upstream/);
+    expect(output).not.toMatch(/mirror source upstream/);
+    // Older obsolete hints must not reappear either.
     expect(output).not.toContain('git show HEAD');
     expect(output).not.toMatch(/git diff HEAD [0-9a-f]{8}/);
     // Parenthesized suffix form for sha (pre-v0.5.5) must not reappear.
