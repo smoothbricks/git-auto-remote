@@ -18,6 +18,7 @@ import {
   git,
   gitTry,
   hasStagedChanges,
+  hasUnresolvedMergeConflicts,
   isAncestorOf,
   listCommitsInRange,
   readCommitMeta,
@@ -96,9 +97,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   }
   const review = getReviewPending();
   if (review && review.remote === mirror.remote) {
-    console.error(
-      `[mirror ${mirror.remote}] Review pending on ${review.sourceSha.slice(0, 8)} (${review.subject}).`,
-    );
+    console.error(`[mirror ${mirror.remote}] Review pending on ${review.sourceSha.slice(0, 8)} (${review.subject}).`);
     console.error(`  Continue:  git-auto-remote mirror continue ${mirror.remote}`);
     console.error(`  Skip:      git-auto-remote mirror skip ${mirror.remote}`);
     return 1;
@@ -127,9 +126,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   }
   const head = revParse(`refs/remotes/${mirror.remote}/${mirror.syncBranch}`);
   if (!head) {
-    console.error(
-      `[mirror ${mirror.remote}] Cannot resolve refs/remotes/${mirror.remote}/${mirror.syncBranch}.`,
-    );
+    console.error(`[mirror ${mirror.remote}] Cannot resolve refs/remotes/${mirror.remote}/${mirror.syncBranch}.`);
     return 1;
   }
   if (last === head) {
@@ -197,11 +194,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
           printSegmentSummary(mirror.remote, applied, skipped, 'conflict');
           return 2;
         }
-        console.error(
-          `[mirror ${mirror.remote}] Conflict during apply. Resolve the conflicts, git add, then one of:`,
-        );
-        console.error(`    git-auto-remote mirror continue ${mirror.remote}`);
-        console.error(`    git-auto-remote mirror skip     ${mirror.remote}   # drop this commit`);
+        printAmStopMessage(mirror.remote);
         return 1;
       }
       if (result === 'error') {
@@ -218,11 +211,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
       // touch regeneratePaths don't need regen (their inputs either didn't
       // change the derived output or will be handled the next time the user
       // runs their normal install/build workflow).
-      if (
-        mirror.regenerateCommand &&
-        mirror.regeneratePaths.length > 0 &&
-        anyHasRegenerate(seg.commits)
-      ) {
+      if (mirror.regenerateCommand && mirror.regeneratePaths.length > 0 && anyHasRegenerate(seg.commits)) {
         runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote);
       }
       // Count what we applied vs skipped.
@@ -312,16 +301,7 @@ async function handlePartial(
 
   // ----- Sub-case C: pure-review-only commit (included is empty) -----
   if (included.length === 0) {
-    return handlePureReview(
-      commit.sha,
-      subject,
-      review,
-      regenerate,
-      outside,
-      mirror,
-      options,
-      trackingBefore,
-    );
+    return handlePureReview(commit.sha, subject, review, regenerate, outside, mirror, options, trackingBefore);
   }
 
   // ----- Sub-case A/B: included non-empty. Apply included subset via `git am`. -----
@@ -359,11 +339,7 @@ async function handlePartial(
       clearReviewPending();
       return { kind: 'stopped' };
     }
-    console.error(
-      `[mirror ${mirror.remote}] Conflict applying partial. Resolve the conflicts, git add, then one of:`,
-    );
-    console.error(`    git-auto-remote mirror continue ${mirror.remote}`);
-    console.error(`    git-auto-remote mirror skip     ${mirror.remote}   # drop this commit`);
+    printAmStopMessage(mirror.remote);
     return { kind: 'error' };
   }
   if (applyResult === 'error') {
@@ -381,11 +357,7 @@ async function handlePartial(
   // Run regenerate BEFORE the review overlay (if the source commit touched
   // any regeneratePaths) so HEAD reflects included + regen, and the worktree
   // shows only the review content as unstaged.
-  if (
-    mirror.regenerateCommand &&
-    mirror.regeneratePaths.length > 0 &&
-    regenerate.length > 0
-  ) {
+  if (mirror.regenerateCommand && mirror.regeneratePaths.length > 0 && regenerate.length > 0) {
     runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote);
   }
 
@@ -422,9 +394,7 @@ async function handlePartial(
       return { kind: 'skipped' };
     }
     if (outcome === 'dirty-tree') {
-      console.error(
-        `[mirror ${mirror.remote}]   handler left working tree dirty; aborting for safety.`,
-      );
+      console.error(`[mirror ${mirror.remote}]   handler left working tree dirty; aborting for safety.`);
       return { kind: 'error' };
     }
     // punted: rewind HEAD + tracking, surface next run.
@@ -543,9 +513,7 @@ function handlePureReview(
     }
     if (outcome === 'dirty-tree') {
       // Handler didn't cleanly commit but left staged/worktree changes. Abort.
-      console.error(
-        `[mirror ${mirror.remote}]   handler left working tree dirty; aborting for safety.`,
-      );
+      console.error(`[mirror ${mirror.remote}]   handler left working tree dirty; aborting for safety.`);
       return { kind: 'error' };
     }
     // punted
@@ -578,7 +546,12 @@ function handlePureReview(
 
 function finalizePureReviewAsResolved(
   sha: string,
-  meta: { authorName: string; authorEmail: string; authorDate: string; message: string },
+  meta: {
+    authorName: string;
+    authorEmail: string;
+    authorDate: string;
+    message: string;
+  },
   remote: string,
 ): PartialResult {
   // If the handler created a commit itself, HEAD moved and we just advance tracking.
@@ -604,6 +577,41 @@ function finalizePureReviewAsResolved(
   updateTrackingRef(remote, sha);
   console.error(`[mirror ${remote}]   handler exit=0 (resolved)`);
   return { kind: 'applied' };
+}
+
+/**
+ * Emit appropriate user-facing messaging when `git am` stopped mid-apply.
+ * There are two distinct stop states:
+ *
+ *   1. CONFLICTED: `git am --3way` left conflict markers in files (status
+ *      XY codes like UU, AU, UD). User resolves by editing the files, running
+ *      `git add`, then `mirror continue`. `mirror skip` drops the commit.
+ *
+ *   2. STRUCTURAL: `git am` failed BEFORE the 3-way merge could run - typically
+ *      "could not build fake ancestor" when the patch references files (e.g.
+ *      rename source, mode-change target) that do not exist on HEAD. Worktree
+ *      is clean, nothing to resolve manually. Only `mirror skip` (or `git am
+ *      --abort`) recovers. `mirror continue` here would fail with "no changes -
+ *      did you forget to use 'git add'?" which is misleading in this context.
+ *
+ * The difference matters: pointing a user at `mirror continue` + `git add` when
+ * there are no conflict markers is confusing and wastes time.
+ */
+function printAmStopMessage(remote: string): void {
+  if (hasUnresolvedMergeConflicts()) {
+    console.error(`[mirror ${remote}] Conflict during apply. Resolve the conflicts, git add, then one of:`);
+    console.error(`    git-auto-remote mirror continue ${remote}`);
+    console.error(`    git-auto-remote mirror skip     ${remote}   # drop this commit`);
+    return;
+  }
+  console.error(`[mirror ${remote}] 'git am' stopped structurally - the patch references content missing from HEAD`);
+  console.error(
+    `[mirror ${remote}]   (e.g. a rename from a path not present, or a mode change on a file that wasn't synced).`,
+  );
+  console.error(`[mirror ${remote}]   Working tree is clean; there are no conflict markers to resolve.`);
+  console.error(`    git-auto-remote mirror skip     ${remote}   # drop this commit and continue`);
+  console.error(`    git am --show-current-patch=diff              # inspect the failing patch`);
+  console.error(`    git am --abort                                # bail out entirely`);
 }
 
 function printPartialHeader(

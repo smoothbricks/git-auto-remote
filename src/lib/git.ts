@@ -22,7 +22,10 @@ export class GitError extends Error {
 /** Run git and return stdout. Throws GitError on non-zero exit. */
 export function git(...args: string[]): string {
   try {
-    return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    return execFileSync('git', args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
   } catch (err) {
     const e = err as { status?: number | null; stderr?: Buffer | string };
     const stderr = e.stderr ? e.stderr.toString() : '';
@@ -130,6 +133,33 @@ export function hasStagedChanges(): boolean {
   }
 }
 
+/**
+ * True iff the working tree has paths in an UNRESOLVED merge/am conflict state.
+ * Distinct from `workingTreeDirty()` - we specifically look for porcelain
+ * status codes that indicate an unresolved 3-way merge, not plain
+ * modifications or additions.
+ *
+ * Relevant codes (XY in `git status --porcelain`): DD, AU, UD, UA, DU, AA, UU.
+ * See git-status(1) "Short Format".
+ *
+ * Used to distinguish "git am stopped with conflict markers the user can
+ * resolve + `git add` + continue" from "git am stopped structurally (fake-
+ * ancestor build failure, missing rename source, etc.) where the worktree is
+ * clean and the only recovery is skip or abort".
+ */
+export function hasUnresolvedMergeConflicts(): boolean {
+  const out = gitTry('status', '--porcelain');
+  if (!out) return false;
+  for (const line of out.split('\n')) {
+    if (line.length < 2) continue;
+    const xy = line.slice(0, 2);
+    if (xy === 'DD' || xy === 'AU' || xy === 'UD' || xy === 'UA' || xy === 'DU' || xy === 'AA' || xy === 'UU') {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** SHAs of commits in the range `from..to`, oldest-first (topological order). */
 export function listCommitsInRange(from: string, to: string): string[] {
   const out = gitTry('rev-list', '--reverse', '--topo-order', `${from}..${to}`);
@@ -166,11 +196,10 @@ export type CommitMeta = {
 
 export function readCommitMeta(sha: string): CommitMeta {
   // execFileSync directly so we keep the raw message (no .trim() surprise).
-  const out = execFileSync(
-    'git',
-    ['show', '-s', '--format=%an%x00%ae%x00%aI%x00%B', sha],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
-  );
+  const out = execFileSync('git', ['show', '-s', '--format=%an%x00%ae%x00%aI%x00%B', sha], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   // split with limit 4: first 3 are name/email/date, everything else is message
   // (rejoined with NUL so we don't lose any separator that happened to be in msg).
   const parts = out.split('\x00');
