@@ -4,6 +4,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { postApplypatch } from '../src/commands/post-applypatch.js';
+import { trackingRefName } from '../src/lib/mirror-state.js';
+
+const TRACKING_UPSTREAM = trackingRefName('upstream');
 
 /**
  * Direct unit tests for the post-applypatch handler. We fake a `.git/rebase-apply`
@@ -76,13 +79,45 @@ describe('postApplypatch', () => {
 
     const trackingSha = execFileSync(
       'git',
-      ['rev-parse', 'refs/git-auto-remote/mirror/upstream'],
+      ['rev-parse', TRACKING_UPSTREAM],
       { cwd: repoDir, encoding: 'utf8' },
     ).trim();
     expect(trackingSha).toBe(sha);
 
     // Sentinel still present - we're not yet on the last patch.
     expect(existsSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'))).toBe(true);
+  });
+
+  test('readTrackingRef falls back to legacy single-component ref, then migrates on write', () => {
+    const sha = seedCommit();
+    // Simulate an old-style tracking ref from v0.3.1 or earlier.
+    execFileSync('git', ['update-ref', 'refs/git-auto-remote/mirror/upstream', sha], {
+      cwd: repoDir,
+    });
+
+    // First, the hook reads via getMirrorInProgress... but to exercise
+    // readTrackingRef path, we piggyback on the existing "advance + clear"
+    // flow: set sentinel, run hook with next=2 last=1 -> advance + clear.
+    mkdirSync(join(repoDir, '.git/git-auto-remote'), { recursive: true });
+    writeFileSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'), 'upstream');
+    writeRebaseApply(sha, 2, 1);
+
+    postApplypatch();
+
+    // New ref got the value.
+    const newSha = execFileSync('git', ['rev-parse', TRACKING_UPSTREAM], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    }).trim();
+    expect(newSha).toBe(sha);
+
+    // Legacy ref is gone (migrated away). `rev-parse --verify` exits non-zero
+    // when the ref is missing, so use spawnSync to tolerate that.
+    const legacyCheck = Bun.spawnSync({
+      cmd: ['git', 'rev-parse', '--verify', '--quiet', 'refs/git-auto-remote/mirror/upstream'],
+      cwd: repoDir,
+    });
+    expect(legacyCheck.exitCode).not.toBe(0);
   });
 
   test('clears the sentinel when this is the last patch (next > last)', () => {
@@ -98,7 +133,7 @@ describe('postApplypatch', () => {
     // Ref still advanced.
     const trackingSha = execFileSync(
       'git',
-      ['rev-parse', 'refs/git-auto-remote/mirror/upstream'],
+      ['rev-parse', TRACKING_UPSTREAM],
       { cwd: repoDir, encoding: 'utf8' },
     ).trim();
     expect(trackingSha).toBe(sha);
