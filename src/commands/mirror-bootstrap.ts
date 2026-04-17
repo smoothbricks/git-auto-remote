@@ -3,18 +3,25 @@ import { getMirrorConfig } from '../lib/mirror-config.js';
 import { readTrackingRef, updateTrackingRef } from '../lib/mirror-state.js';
 
 /**
- * Initialize the tracking ref for a mirror. Run once per clone.
+ * Initialize the tracking ref for a mirror.
  *
- * Semantics of the <sha> argument depend on whether it's a root commit:
+ * OPTIONAL: `mirror pull` works fine without any bootstrap at all - the
+ * absence of a tracking ref is interpreted as "local has no prior mirror
+ * content; replay the mirror's full history from its root". Use bootstrap
+ * only when you want to SKIP PAST a portion of the mirror's history because
+ * its content is already locally reflected.
  *
- *   - Non-root commit: caller asserts <sha>'s content is already locally
- *     reflected (e.g. public HEAD matches its tree), so `mirror pull` will
- *     replay children of <sha> only (exclusive).
+ * <sha> semantics: the tracking ref is inclusive-right, exclusive-left in
+ * rev-list terms, i.e. `mirror pull` enumerates `<sha>..<head>` - so the
+ * commit you bootstrap AT is treated as "already here, don't replay it,
+ * replay its children onward".
  *
- *   - Root commit (no parent): bootstrapping at a root semantically means
- *     "local has no prior mirror content at all". `mirror pull` will include
- *     the root itself in the replay stream (inclusive) so its tree lands
- *     before any descendant commit depends on it.
+ * Bootstrapping at a ROOT commit is almost never what you want: `<root>..
+ * <head>` excludes the root, meaning every file the mirror creates in its
+ * root commit would be missing from local HEAD, and downstream commits
+ * modifying those files would hit modify/delete conflicts. The command
+ * warns in that case and points you at the simpler alternative (skip
+ * bootstrap entirely, just run `mirror pull`).
  *
  * Refuses to overwrite an existing tracking ref (use `--force` to re-bootstrap).
  */
@@ -30,6 +37,8 @@ export function mirrorBootstrap(remote: string, shaArg: string, force: boolean):
   if (existing && !force) {
     console.error(`[git-auto-remote] Mirror '${remote}' already bootstrapped at ${existing.slice(0, 12)}.`);
     console.error(`  Re-bootstrap with:  git-auto-remote mirror bootstrap ${remote} <sha> --force`);
+    console.error(`  Or remove the tracking ref to fall back to full-history replay on next pull:`);
+    console.error(`    git update-ref -d refs/git-auto-remote/mirror/${remote}/last-synced`);
     return 1;
   }
 
@@ -39,12 +48,19 @@ export function mirrorBootstrap(remote: string, shaArg: string, force: boolean):
     return 1;
   }
 
-  updateTrackingRef(remote, sha);
   if (isRootCommit(sha)) {
-    console.error(`[git-auto-remote] Mirror '${remote}' bootstrapped at ${sha.slice(0, 12)} (root commit - `);
-    console.error(`  will be INCLUDED in the next 'mirror pull' replay so its tree lands on local HEAD).`);
-  } else {
-    console.error(`[git-auto-remote] Mirror '${remote}' bootstrapped at ${sha.slice(0, 12)}.`);
+    console.error(`[git-auto-remote] Warning: ${sha.slice(0, 12)} is a ROOT commit.`);
+    console.error(`  Bootstrapping here means its content is SKIPPED from the next 'mirror pull'`);
+    console.error(`  (bootstrap semantics: "this SHA's content is already locally reflected").`);
+    console.error(`  If you want the root INCLUDED in the replay (fresh clone, no prior content),`);
+    console.error(`  skip bootstrap entirely - just run 'mirror pull ${remote}'.`);
+    if (!force) {
+      console.error(`  To proceed anyway, re-run with --force.`);
+      return 1;
+    }
   }
+
+  updateTrackingRef(remote, sha);
+  console.error(`[git-auto-remote] Mirror '${remote}' bootstrapped at ${sha.slice(0, 12)}.`);
   return 0;
 }

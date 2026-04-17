@@ -160,9 +160,19 @@ export function hasUnresolvedMergeConflicts(): boolean {
   return false;
 }
 
-/** SHAs of commits in the range `from..to`, oldest-first (topological order). */
-export function listCommitsInRange(from: string, to: string): string[] {
-  const out = gitTry('rev-list', '--reverse', '--topo-order', `${from}..${to}`);
+/**
+ * SHAs of commits in the range `from..to`, oldest-first (topological order).
+ *
+ * When `from` is null, returns ALL commits reachable from `to` (including the
+ * root). This is the "full-history replay" case: no tracking ref set yet
+ * means the local side has no prior mirror content, so every commit on the
+ * mirror is new. When `from` is a SHA, uses standard `<from>..<to>` semantics
+ * which excludes `<from>` - appropriate because the caller asserts <from>'s
+ * content is already reflected locally.
+ */
+export function listCommitsInRange(from: string | null, to: string): string[] {
+  const range = from ? `${from}..${to}` : to;
+  const out = gitTry('rev-list', '--reverse', '--topo-order', range);
   if (!out) return [];
   return out.split('\n').filter((line) => line.length > 0);
 }
