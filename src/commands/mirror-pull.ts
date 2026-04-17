@@ -165,7 +165,11 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
       printApplyingLines(seg.commits, mirror.remote);
       setMirrorInProgress(mirror.remote);
       const result = applyRange(seg.commits, mirror.syncPaths, mirror.excludePaths);
-      clearMirrorInProgress();
+      // IMPORTANT: on 'conflict' we leave the sentinel set so that when the user
+      // resolves + `git am --continue`, our post-applypatch hook still recognizes
+      // the in-progress am as ours and advances the tracking ref per patch.
+      // post-applypatch clears the sentinel after the last patch of the run.
+      if (result === 'applied') clearMirrorInProgress();
       if (result === 'conflict') {
         // `git am` stopped; leave it for the user (or abort in CI mode).
         if (options.nonInteractive) {
@@ -266,7 +270,9 @@ async function handlePartial(
   // Apply the in-scope subset.
   setMirrorInProgress(mirror.remote);
   const applyResult = applyPartial(commit.sha, mirror.syncPaths, mirror.excludePaths);
-  clearMirrorInProgress();
+  // Same rule as applyRange: keep the sentinel set on conflict so post-applypatch
+  // on the user's `git am --continue` updates the tracking ref.
+  if (applyResult === 'applied') clearMirrorInProgress();
   if (applyResult !== 'applied') {
     if (applyResult === 'conflict') {
       if (options.nonInteractive) {

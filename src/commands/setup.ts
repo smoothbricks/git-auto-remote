@@ -21,6 +21,8 @@ export function setup(options: SetupOptions = {}): number {
       console.error(`[git-auto-remote] ${r.path}: installed`);
     } else if (r.kind === 'appended') {
       console.error(`[git-auto-remote] ${r.path}: appended to existing hook`);
+    } else if (r.kind === 'updated') {
+      console.error(`[git-auto-remote] ${r.path}: updated (new version or snippet)`);
     }
   }
 

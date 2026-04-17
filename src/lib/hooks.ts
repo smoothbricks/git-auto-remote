@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { gitDir } from './git.js';
+import { VERSION } from './version.js';
 
 export type HookName = 'post-checkout' | 'pre-push' | 'post-merge' | 'post-applypatch';
 
@@ -25,24 +26,42 @@ function exitBehavior(name: HookName): string {
 /**
  * Shell snippet injected into hook files. The string `git-auto-remote <hook>` is the
  * marker used to detect our presence in existing hooks (for chainability and idempotence).
+ *
+ * The `@<major>.<minor>.x` pin on the bunx call ensures the hook invokes the same
+ * release line the installer was run from, rather than whatever bunx has cached.
+ * Upgrading across a minor bump is done by re-running `git-auto-remote setup` with
+ * the new version - the installer detects and replaces an outdated block in place.
  */
 function hookSnippet(name: HookName): string {
   return [
-    `# >>> git-auto-remote ${name} >>>`,
+    `# >>> git-auto-remote ${name} ${VERSION} >>>`,
     `# Managed by git-auto-remote. Safe to chain with other hooks above/below these markers.`,
-    `bunx --bun git-auto-remote ${name} "$@" ${exitBehavior(name)}`,
+    `bunx --bun git-auto-remote@${pinForVersion(VERSION)} ${name} "$@" ${exitBehavior(name)}`,
     `# <<< git-auto-remote ${name} <<<`,
   ].join('\n');
 }
 
+/** Convert "0.3.1" -> "0.3.x" so patch-level bugfixes roll out without re-running setup. */
+function pinForVersion(v: string): string {
+  const [major, minor] = v.split('.');
+  return `${major}.${minor}.x`;
+}
+
 const SHEBANG = '#!/usr/bin/env bash';
-const START_MARKER_RE = (name: HookName) => new RegExp(`^# >>> git-auto-remote ${name} >>>$`, 'm');
+// Start marker tolerates any trailing version suffix so older-generation blocks
+// (without a version) are still detected and replaced in place.
+const START_MARKER_RE = (name: HookName) =>
+  new RegExp(`^# >>> git-auto-remote ${name}(?:\\s+\\S+)? >>>$`, 'm');
 const FULL_BLOCK_RE = (name: HookName) =>
-  new RegExp(`\\n?# >>> git-auto-remote ${name} >>>[\\s\\S]*?# <<< git-auto-remote ${name} <<<\\n?`, 'm');
+  new RegExp(
+    `\\n?# >>> git-auto-remote ${name}(?:\\s+\\S+)? >>>[\\s\\S]*?# <<< git-auto-remote ${name} <<<\\n?`,
+    'm',
+  );
 
 export type InstallResult =
   | { kind: 'installed'; path: string }
   | { kind: 'already-present'; path: string }
+  | { kind: 'updated'; path: string }
   | { kind: 'appended'; path: string };
 
 /**
@@ -65,7 +84,18 @@ export function installHook(name: HookName): InstallResult {
 
   const existing = readFileSync(path, 'utf8');
   if (START_MARKER_RE(name).test(existing)) {
-    return { kind: 'already-present', path };
+    // Our block is present. If its content matches what we'd write now, no-op;
+    // otherwise replace in place (happens after a version bump, or when the
+    // snippet format itself changes across releases).
+    const desired = hookSnippet(name);
+    const match = existing.match(FULL_BLOCK_RE(name));
+    if (match && match[0].trim() === desired.trim()) {
+      return { kind: 'already-present', path };
+    }
+    const updated = existing.replace(FULL_BLOCK_RE(name), '\n' + desired + '\n');
+    writeFileSync(path, updated);
+    chmodSync(path, 0o755);
+    return { kind: 'updated', path };
   }
 
   const separator = existing.endsWith('\n') ? '\n' : '\n\n';

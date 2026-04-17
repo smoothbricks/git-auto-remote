@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { gitDir } from '../lib/git.js';
-import { getMirrorInProgress, updateTrackingRef } from '../lib/mirror-state.js';
+import { clearMirrorInProgress, getMirrorInProgress, updateTrackingRef } from '../lib/mirror-state.js';
 
 /**
  * Git's `post-applypatch` hook runs after each patch `git am` successfully applies.
@@ -40,5 +40,21 @@ export function postApplypatch(): number {
   } catch {
     // Best-effort: never fail the hook and stop the am run.
   }
+
+  // If this patch is the last one of our run, clear the sentinel. Works for
+  // both clean ranges and conflict-resolution continues: on the last patch
+  // `next` has already been incremented past `last`.
+  const lastPath = join(applyDir, 'last');
+  if (existsSync(lastPath)) {
+    const last = Number.parseInt(readFileSync(lastPath, 'utf8').trim(), 10);
+    if (Number.isFinite(last) && next > last) {
+      try {
+        clearMirrorInProgress();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   return 0;
 }
