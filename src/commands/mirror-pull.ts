@@ -6,7 +6,7 @@ import {
   printApplyingLines,
   printSegmentSummary,
 } from '../lib/apply.js';
-import { type ClassifiedCommit, classify, segment } from '../lib/classify.js';
+import { anyHasRegenerate, type ClassifiedCommit, classify, segment } from '../lib/classify.js';
 import {
   amInProgress,
   changedPaths,
@@ -26,6 +26,7 @@ import {
 } from '../lib/git.js';
 import { runPartialHandler } from '../lib/handler.js';
 import { getMirrorConfig, listMirrorConfigs, type MirrorConfig } from '../lib/mirror-config.js';
+import { runRegenerate } from '../lib/regen.js';
 import {
   clearMirrorInProgress,
   clearPendingCommit,
@@ -44,7 +45,7 @@ export type MirrorPullOptions = {
   remote?: string;
   /** When true, stop (exit 2) at partials instead of pausing for human review. */
   nonInteractive?: boolean;
-  /** Override `fork-remote.<name>.partialHandler` for this invocation. */
+  /** Override `auto-remote.<name>.partialHandler` for this invocation. */
   onPartial?: string | null;
 };
 
@@ -61,7 +62,7 @@ export async function mirrorPull(options: MirrorPullOptions): Promise<number> {
 
   if (options.remote && mirrors.length === 0) {
     console.error(`[git-auto-remote] No mirror configured for remote '${options.remote}'.`);
-    console.error(`  Configure with: git config fork-remote.${options.remote}.syncPaths "<paths>"`);
+    console.error(`  Configure with: git config auto-remote.${options.remote}.syncPaths "<paths>"`);
     return 1;
   }
 
@@ -161,6 +162,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     syncPaths: mirror.syncPaths,
     excludePaths: mirror.excludePaths,
     reviewPaths: mirror.reviewPaths,
+    regeneratePaths: mirror.regeneratePaths,
   };
   const shas = listCommitsInRange(last, head);
   const classified: ClassifiedCommit[] = shas.map((sha) => ({
@@ -181,6 +183,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
         mirror.syncPaths,
         mirror.excludePaths,
         mirror.reviewPaths,
+        mirror.regeneratePaths,
       );
       // IMPORTANT: on 'conflict' we leave the sentinel set so that when the user
       // resolves + `git am --continue`, our post-applypatch hook still recognizes
@@ -209,6 +212,19 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
       // authoritative update; the post-applypatch hook advances per-patch but
       // may not be running (e.g. in tests or offline bunx). Safe to set idempotently.
       updateTrackingRef(mirror.remote, seg.commits[seg.commits.length - 1].sha);
+      // Run regenerate if any commit in this range touched regeneratePaths.
+      // The trigger is "upstream bumped the derived file" - we drop their
+      // version from the patch and produce ours locally. Commits that don't
+      // touch regeneratePaths don't need regen (their inputs either didn't
+      // change the derived output or will be handled the next time the user
+      // runs their normal install/build workflow).
+      if (
+        mirror.regenerateCommand &&
+        mirror.regeneratePaths.length > 0 &&
+        anyHasRegenerate(seg.commits)
+      ) {
+        runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote);
+      }
       // Count what we applied vs skipped.
       for (const c of seg.commits) {
         if (c.classification.kind === 'out-of-scope') skipped += 1;
@@ -278,7 +294,7 @@ async function handlePartial(
   options: MirrorPullOptions,
 ): Promise<PartialResult> {
   if (commit.classification.kind !== 'partial') return { kind: 'error' };
-  const { included, review, outside } = commit.classification;
+  const { included, review, regenerate, outside } = commit.classification;
   const subject = commitSubject(commit.sha);
   const handler = options.onPartial ?? mirror.partialHandler;
 
@@ -287,7 +303,7 @@ async function handlePartial(
   // and the tracking ref untouched means CI will surface the same partial until
   // a human handles it.
   if (options.nonInteractive && !handler) {
-    printPartialHeader(mirror.remote, subject, commit.sha, review, outside);
+    printPartialHeader(mirror.remote, subject, commit.sha, review, regenerate, outside);
     return { kind: 'stopped' };
   }
 
@@ -296,11 +312,20 @@ async function handlePartial(
 
   // ----- Sub-case C: pure-review-only commit (included is empty) -----
   if (included.length === 0) {
-    return handlePureReview(commit.sha, subject, review, outside, mirror, options, trackingBefore);
+    return handlePureReview(
+      commit.sha,
+      subject,
+      review,
+      regenerate,
+      outside,
+      mirror,
+      options,
+      trackingBefore,
+    );
   }
 
   // ----- Sub-case A/B: included non-empty. Apply included subset via `git am`. -----
-  printPartialHeader(mirror.remote, subject, commit.sha, review, outside);
+  printPartialHeader(mirror.remote, subject, commit.sha, review, regenerate, outside);
 
   setMirrorInProgress(mirror.remote);
   const applyResult = applyPartial(
@@ -308,6 +333,7 @@ async function handlePartial(
     mirror.syncPaths,
     mirror.excludePaths,
     mirror.reviewPaths,
+    mirror.regeneratePaths,
   );
 
   if (applyResult === 'conflict') {
@@ -321,6 +347,7 @@ async function handlePartial(
       subject,
       included,
       review,
+      regenerate,
       outside,
       phase: 'am-in-progress',
     });
@@ -350,6 +377,17 @@ async function handlePartial(
   // Belt + suspenders: advance tracking ref explicitly in case the hook isn't
   // installed (e.g. tests, offline bunx).
   updateTrackingRef(mirror.remote, commit.sha);
+
+  // Run regenerate BEFORE the review overlay (if the source commit touched
+  // any regeneratePaths) so HEAD reflects included + regen, and the worktree
+  // shows only the review content as unstaged.
+  if (
+    mirror.regenerateCommand &&
+    mirror.regeneratePaths.length > 0 &&
+    regenerate.length > 0
+  ) {
+    runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote);
+  }
 
   // If a handler is configured: worktree gets review overlay first, then handler runs.
   if (handler) {
@@ -421,6 +459,7 @@ async function handlePartial(
     subject,
     included,
     review,
+    regenerate,
     outside,
     phase: 'review-pause',
   });
@@ -442,13 +481,24 @@ function handlePureReview(
   sha: string,
   subject: string,
   review: readonly string[],
+  regenerate: readonly string[],
   outside: readonly string[],
   mirror: MirrorConfig,
   options: MirrorPullOptions,
   _trackingBefore: string | null,
 ): PartialResult {
   const handler = options.onPartial ?? mirror.partialHandler;
-  printPartialHeader(mirror.remote, subject, sha, review, outside);
+  printPartialHeader(mirror.remote, subject, sha, review, regenerate, outside);
+
+  // MVP: regenerate is NOT auto-run for pure-review-pause, since there's no
+  // HEAD commit to amend onto. Let the user run the command themselves after
+  // staging + `mirror continue` (or just rely on their next normal `bun i`
+  // workflow to reconcile).
+  if (regenerate.length > 0 && mirror.regenerateCommand) {
+    console.error(
+      `[mirror ${mirror.remote}]   (regenerate paths touched: run '${mirror.regenerateCommand}' after continue if needed)`,
+    );
+  }
 
   // Apply review overlay now so handler / user can see and manipulate.
   const overlay = applyReviewToWorktree(sha, review, mirror.excludePaths);
@@ -518,6 +568,7 @@ function handlePureReview(
     subject,
     included: [],
     review,
+    regenerate,
     outside,
     phase: 'pure-review-pause',
   });
@@ -560,11 +611,15 @@ function printPartialHeader(
   subject: string,
   sha: string,
   review: readonly string[],
+  regenerate: readonly string[],
   outside: readonly string[],
 ): void {
   console.error(`[mirror ${remote}] Partial: ${subject} (${sha.slice(0, 8)})`);
   if (review.length > 0) {
     console.error(`  Review (in worktree, unstaged): ${review.join(', ')}`);
+  }
+  if (regenerate.length > 0) {
+    console.error(`  Regenerate (auto-produced):     ${regenerate.join(', ')}`);
   }
   if (outside.length > 0) {
     console.error(`  Outside sync scope (dropped):   ${outside.join(', ')}`);
