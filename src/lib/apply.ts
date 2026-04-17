@@ -5,14 +5,18 @@ import type { ClassifiedCommit } from './classify.js';
 /**
  * Apply a range of clean/out-of-scope commits via `git format-patch | git am`.
  *
- *   git format-patch --stdout <sha>^..<sha> -- <syncPaths> :(exclude)<excludePaths> :(exclude)<reviewPaths>
+ *   git format-patch --stdout <sha>^..<sha> -- <syncPaths>
+ *      :(exclude)<excludePaths>
+ *      :(exclude)<reviewPaths>
+ *      :(exclude)<regeneratePaths>
  *      |  git am --empty=drop --3way
  *
  * Out-of-scope commits produce empty patches and are dropped by `--empty=drop`.
- * Paths matching `excludePaths` OR `reviewPaths` are filtered out at patch-
- * generation time via git's `:(exclude)` pathspec magic so HEAD contains ONLY
- * the `included` bucket. ReviewPaths are applied to the worktree separately
- * via `applyReviewToWorktree`.
+ * Paths matching `excludePaths`, `reviewPaths`, or `regeneratePaths` are
+ * filtered out at patch-generation time via git's `:(exclude)` pathspec magic
+ * so HEAD contains ONLY the `included` bucket. ReviewPaths go to the worktree
+ * via `applyReviewToWorktree`; regeneratePaths get (re-)produced locally by
+ * `regenerateCommand` after the apply succeeds.
  *
  * IMPORTANT - why the range form `<sha>^..<sha>` rather than `-1 <sha>`:
  * `git format-patch -1 <sha> -- <pathspec>` walks BACKWARD through ancestors
@@ -39,6 +43,7 @@ export function applyRange(
   syncPaths: readonly string[],
   excludePaths: readonly string[] = [],
   reviewPaths: readonly string[] = [],
+  regeneratePaths: readonly string[] = [],
 ): 'applied' | 'conflict' | 'error' {
   if (commits.length === 0) return 'applied';
 
@@ -46,6 +51,7 @@ export function applyRange(
     ...syncPaths,
     ...excludePaths.map((p) => `:(exclude)${p}`),
     ...reviewPaths.map((p) => `:(exclude)${p}`),
+    ...regeneratePaths.map((p) => `:(exclude)${p}`),
   ];
 
   const chunks: Buffer[] = [];
@@ -114,12 +120,14 @@ export function applyPartial(
   syncPaths: readonly string[],
   excludePaths: readonly string[] = [],
   reviewPaths: readonly string[] = [],
+  regeneratePaths: readonly string[] = [],
 ): 'applied' | 'conflict' | 'error' {
   return applyRange(
-    [{ sha, classification: { kind: 'clean', included: [] } }],
+    [{ sha, classification: { kind: 'clean', included: [], regenerate: [] } }],
     syncPaths,
     excludePaths,
     reviewPaths,
+    regeneratePaths,
   );
 }
 

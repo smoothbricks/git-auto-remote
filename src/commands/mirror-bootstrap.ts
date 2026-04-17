@@ -11,7 +11,7 @@ export function mirrorBootstrap(remote: string, shaArg: string, force: boolean):
   const mirror = getMirrorConfig(remote);
   if (!mirror) {
     console.error(`[git-auto-remote] No mirror configured for '${remote}'.`);
-    console.error(`  Configure first:  git config fork-remote.${remote}.syncPaths "<paths>"`);
+    console.error(`  Configure first:  git config auto-remote.${remote}.syncPaths "<paths>"`);
     return 1;
   }
 

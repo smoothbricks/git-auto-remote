@@ -35,7 +35,7 @@ describe('getMirrorConfig', () => {
   });
 
   test('applies defaults when only syncPaths is set', () => {
-    gitcfg('fork-remote.public.syncPaths', 'packages');
+    gitcfg('auto-remote.public.syncPaths', 'packages');
     const config = getMirrorConfig('public');
     expect(config).not.toBeNull();
     expect(config?.remote).toBe('public');
@@ -49,13 +49,13 @@ describe('getMirrorConfig', () => {
   });
 
   test('reads explicit values for all keys', () => {
-    gitcfg('fork-remote.public.syncPaths', 'packages tooling');
-    gitcfg('fork-remote.public.excludePaths', 'tooling/sync-with-public.sh');
-    gitcfg('fork-remote.public.reviewPaths', 'tooling/workspace.gitconfig');
-    gitcfg('fork-remote.public.syncBranch', 'release');
-    gitcfg('fork-remote.public.syncTargetBranch', 'private');
-    gitcfg('fork-remote.public.partialHandler', '/path/to/handler.sh');
-    gitcfg('fork-remote.public.pushSyncRef', 'false');
+    gitcfg('auto-remote.public.syncPaths', 'packages tooling');
+    gitcfg('auto-remote.public.excludePaths', 'tooling/sync-with-public.sh');
+    gitcfg('auto-remote.public.reviewPaths', 'tooling/workspace.gitconfig');
+    gitcfg('auto-remote.public.syncBranch', 'release');
+    gitcfg('auto-remote.public.syncTargetBranch', 'private');
+    gitcfg('auto-remote.public.partialHandler', '/path/to/handler.sh');
+    gitcfg('auto-remote.public.pushSyncRef', 'false');
 
     const config = getMirrorConfig('public');
     expect(config?.syncPaths).toEqual(['packages', 'tooling']);
@@ -68,7 +68,7 @@ describe('getMirrorConfig', () => {
   });
 
   test('splits syncPaths on whitespace', () => {
-    gitcfg('fork-remote.public.syncPaths', '  packages\ttooling  ');
+    gitcfg('auto-remote.public.syncPaths', '  packages\ttooling  ');
     expect(getMirrorConfig('public')?.syncPaths).toEqual(['packages', 'tooling']);
   });
 });
@@ -87,15 +87,15 @@ describe('getMirrorConfig with *File keys', () => {
         '   ',
       ].join('\n'),
     );
-    gitcfg('fork-remote.public.syncPathsFile', 'tooling/paths.txt');
+    gitcfg('auto-remote.public.syncPathsFile', 'tooling/paths.txt');
 
     expect(getMirrorConfig('public')?.syncPaths).toEqual(['packages', 'tooling', '.gitignore']);
   });
 
   test('unions inline syncPaths with syncPathsFile contents', () => {
     writeFileSync(join(repoDir, 'paths.txt'), 'packages\ntooling\n');
-    gitcfg('fork-remote.public.syncPaths', 'docs CHANGELOG.md');
-    gitcfg('fork-remote.public.syncPathsFile', 'paths.txt');
+    gitcfg('auto-remote.public.syncPaths', 'docs CHANGELOG.md');
+    gitcfg('auto-remote.public.syncPathsFile', 'paths.txt');
     expect(getMirrorConfig('public')?.syncPaths).toEqual([
       'docs',
       'CHANGELOG.md',
@@ -108,9 +108,9 @@ describe('getMirrorConfig with *File keys', () => {
     writeFileSync(join(repoDir, 'sync.txt'), 'tooling\npackages\n');
     writeFileSync(join(repoDir, 'exclude.txt'), 'tooling/sync-with-public.sh\n');
     writeFileSync(join(repoDir, 'review.txt'), 'tooling/workspace.gitconfig\n');
-    gitcfg('fork-remote.public.syncPathsFile', 'sync.txt');
-    gitcfg('fork-remote.public.excludePathsFile', 'exclude.txt');
-    gitcfg('fork-remote.public.reviewPathsFile', 'review.txt');
+    gitcfg('auto-remote.public.syncPathsFile', 'sync.txt');
+    gitcfg('auto-remote.public.excludePathsFile', 'exclude.txt');
+    gitcfg('auto-remote.public.reviewPathsFile', 'review.txt');
 
     const config = getMirrorConfig('public');
     expect(config?.syncPaths).toEqual(['tooling', 'packages']);
@@ -119,7 +119,7 @@ describe('getMirrorConfig with *File keys', () => {
   });
 
   test('throws (error surfaces) when syncPathsFile points at a missing file', () => {
-    gitcfg('fork-remote.public.syncPathsFile', 'nope.txt');
+    gitcfg('auto-remote.public.syncPathsFile', 'nope.txt');
     expect(() => getMirrorConfig('public')).toThrow();
   });
 });
@@ -130,10 +130,10 @@ describe('listMirrorConfigs', () => {
   });
 
   test('discovers mirrors by presence of syncPaths key', () => {
-    gitcfg('fork-remote.public.syncPaths', 'packages');
-    gitcfg('fork-remote.vendor.syncPaths', 'vendor');
-    // Noise: a fork-remote.* config unrelated to mirroring
-    gitcfg('fork-remote.public.somethingElse', 'x');
+    gitcfg('auto-remote.public.syncPaths', 'packages');
+    gitcfg('auto-remote.vendor.syncPaths', 'vendor');
+    // Noise: a auto-remote.* config unrelated to mirroring
+    gitcfg('auto-remote.public.somethingElse', 'x');
 
     const configs = listMirrorConfigs();
     const names = configs.map((c) => c.remote).sort();
@@ -141,16 +141,16 @@ describe('listMirrorConfigs', () => {
   });
 
   test('skips remotes with empty syncPaths (no-op config)', () => {
-    gitcfg('fork-remote.public.syncPaths', 'packages');
-    gitcfg('fork-remote.quiet.syncPaths', '   ');
+    gitcfg('auto-remote.public.syncPaths', 'packages');
+    gitcfg('auto-remote.quiet.syncPaths', '   ');
     const names = listMirrorConfigs().map((c) => c.remote);
     expect(names).toEqual(['public']);
   });
 
   test('also discovers mirrors that only set syncPathsFile', () => {
     writeFileSync(join(repoDir, 'paths.txt'), 'packages\n');
-    gitcfg('fork-remote.public.syncPaths', 'packages');
-    gitcfg('fork-remote.filed.syncPathsFile', 'paths.txt');
+    gitcfg('auto-remote.public.syncPaths', 'packages');
+    gitcfg('auto-remote.filed.syncPathsFile', 'paths.txt');
     const names = listMirrorConfigs().map((c) => c.remote).sort();
     expect(names).toEqual(['filed', 'public']);
   });

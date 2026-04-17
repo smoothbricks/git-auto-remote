@@ -5,7 +5,7 @@ export function mirrorList(): number {
   const mirrors = listMirrorConfigs();
   if (mirrors.length === 0) {
     console.log('No mirrors configured.');
-    console.log('Configure with: git config fork-remote.<remote>.syncPaths "<paths>"');
+    console.log('Configure with: git config auto-remote.<remote>.syncPaths "<paths>"');
     return 0;
   }
   for (const m of mirrors) {

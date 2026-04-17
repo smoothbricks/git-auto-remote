@@ -87,10 +87,10 @@ beforeEach(() => {
   git(local, 'fetch', '-q', 'upstream');
 
   // 4) Configure mirror settings: syncPaths=packages, target branch=private.
-  git(local, 'config', 'fork-remote.upstream.syncPaths', 'packages');
-  git(local, 'config', 'fork-remote.upstream.syncTargetBranch', 'private');
-  git(local, 'config', 'fork-remote.upstream.syncBranch', 'main');
-  git(local, 'config', 'fork-remote.upstream.pushSyncRef', 'false');
+  git(local, 'config', 'auto-remote.upstream.syncPaths', 'packages');
+  git(local, 'config', 'auto-remote.upstream.syncTargetBranch', 'private');
+  git(local, 'config', 'auto-remote.upstream.syncBranch', 'main');
+  git(local, 'config', 'auto-remote.upstream.pushSyncRef', 'false');
 
   // 5) Bootstrap the tracking ref to upstream's current tip (content is in sync).
   const upstreamTip = git(local, 'rev-parse', 'upstream/main');
@@ -287,7 +287,7 @@ describe('mirror pull with reviewPaths', () => {
     git(seed, 'push', '-q', 'origin', 'main');
     git(local, 'fetch', '-q', 'upstream');
 
-    git(local, 'config', 'fork-remote.upstream.reviewPaths', 'packages/gitconfig');
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/gitconfig');
   });
 
   test('treats a commit touching only a reviewPath as partial (pause for review)', async () => {
@@ -310,7 +310,7 @@ describe('mirror pull with excludePaths', () => {
     git(seed, 'push', '-q', 'origin', 'main');
     git(local, 'fetch', '-q', 'upstream');
 
-    git(local, 'config', 'fork-remote.upstream.excludePaths', 'packages/internal');
+    git(local, 'config', 'auto-remote.upstream.excludePaths', 'packages/internal');
   });
 
   test('excluded paths are dropped entirely: the commit is classified clean and auto-applied', async () => {

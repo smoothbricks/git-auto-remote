@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { git, gitTry } from './git.js';
 
 /**
- * Per-remote mirror configuration read from git config under `fork-remote.<name>.*`.
+ * Per-remote mirror configuration read from git config under `auto-remote.<name>.*`.
  * A remote becomes a "mirror" implicitly by having `syncPaths` (or `syncPathsFile`) set.
  */
 export type MirrorConfig = {
@@ -13,8 +13,21 @@ export type MirrorConfig = {
   syncPaths: readonly string[];
   /** Pathspecs that are never synced, even if they fall under syncPaths. */
   excludePaths: readonly string[];
-  /** Pathspecs (subset of syncPaths) whose changes always trigger a review pause. */
+  /** Pathspecs whose changes trigger a review pause (worktree overlay). Orthogonal to syncPaths. */
   reviewPaths: readonly string[];
+  /**
+   * Pathspecs whose changes are dropped from incoming patches and (re-)produced locally
+   * by `regenerateCommand` after each apply. Typical targets: bun.lock, generated
+   * tsconfig.json references. Orthogonal to syncPaths.
+   */
+  regeneratePaths: readonly string[];
+  /**
+   * Shell command (run via `sh -c`) that produces `regeneratePaths` from current sources.
+   * For nix/devenv-based repos whose tools live inside a project env, wrap accordingly:
+   *   regenerateCommand = devenv shell -c 'bun i && bun run nx sync'
+   * so `bun`/`nx` resolve to the pinned versions regardless of the PATH git inherited.
+   */
+  regenerateCommand: string | null;
   /** Branch on the mirror to pull from. Default: the remote's HEAD branch, or 'main'. */
   syncBranch: string;
   /** Local branch that receives the replayed commits. Default: remote.name (e.g. 'public'). */
@@ -31,11 +44,11 @@ export type MirrorConfig = {
 /** List all remotes that are configured as mirrors (have syncPaths or syncPathsFile set). */
 export function listMirrorConfigs(): MirrorConfig[] {
   // Git lower-cases the final key segment on storage.
-  const out = gitTry('config', '--get-regexp', '^fork-remote\\..+\\.(syncpaths|syncpathsfile)');
+  const out = gitTry('config', '--get-regexp', '^auto-remote\\..+\\.(syncpaths|syncpathsfile)');
   if (!out) return [];
   const remotes = new Set<string>();
   for (const line of out.split('\n')) {
-    const match = line.match(/^fork-remote\.(.+)\.(syncpaths|syncpathsfile)\s/i);
+    const match = line.match(/^auto-remote\.(.+)\.(syncpaths|syncpathsfile)\s/i);
     if (match) remotes.add(match[1]);
   }
   return [...remotes]
@@ -49,18 +62,20 @@ export function getMirrorConfig(remote: string): MirrorConfig | null {
 
   const excludePaths = readPathList(remote, 'excludePaths');
   const reviewPaths = readPathList(remote, 'reviewPaths');
+  const regeneratePaths = readPathList(remote, 'regeneratePaths');
+  const regenerateCommand = gitTry('config', '--get', `auto-remote.${remote}.regenerateCommand`);
 
   const syncBranch =
-    gitTry('config', '--get', `fork-remote.${remote}.syncBranch`) ??
+    gitTry('config', '--get', `auto-remote.${remote}.syncBranch`) ??
     detectRemoteHead(remote) ??
     'main';
 
   const syncTargetBranch =
-    gitTry('config', '--get', `fork-remote.${remote}.syncTargetBranch`) ?? remote;
+    gitTry('config', '--get', `auto-remote.${remote}.syncTargetBranch`) ?? remote;
 
-  const partialHandler = gitTry('config', '--get', `fork-remote.${remote}.partialHandler`);
+  const partialHandler = gitTry('config', '--get', `auto-remote.${remote}.partialHandler`);
 
-  const pushSyncRefRaw = gitTry('config', '--get', `fork-remote.${remote}.pushSyncRef`);
+  const pushSyncRefRaw = gitTry('config', '--get', `auto-remote.${remote}.pushSyncRef`);
   const pushSyncRef = pushSyncRefRaw === null ? true : pushSyncRefRaw !== 'false';
 
   return {
@@ -68,6 +83,8 @@ export function getMirrorConfig(remote: string): MirrorConfig | null {
     syncPaths,
     excludePaths,
     reviewPaths,
+    regeneratePaths,
+    regenerateCommand: regenerateCommand || null,
     syncBranch,
     syncTargetBranch,
     partialHandler: partialHandler || null,
@@ -76,21 +93,21 @@ export function getMirrorConfig(remote: string): MirrorConfig | null {
 }
 
 /**
- * Read a path list from git config, merging inline `fork-remote.X.<key>`
- * (whitespace-split) and file-referenced `fork-remote.X.<key>File`
+ * Read a path list from git config, merging inline `auto-remote.X.<key>`
+ * (whitespace-split) and file-referenced `auto-remote.X.<key>File`
  * (newline-separated with # comments, like .gitignore).
  */
 function readPathList(remote: string, key: string): string[] {
   const paths: string[] = [];
 
-  const inline = gitTry('config', '--get', `fork-remote.${remote}.${key}`);
+  const inline = gitTry('config', '--get', `auto-remote.${remote}.${key}`);
   if (inline) {
     for (const p of inline.split(/\s+/)) {
       if (p.length > 0) paths.push(p);
     }
   }
 
-  const filePath = gitTry('config', '--get', `fork-remote.${remote}.${key}File`);
+  const filePath = gitTry('config', '--get', `auto-remote.${remote}.${key}File`);
   if (filePath) {
     for (const p of readPathsFile(filePath)) paths.push(p);
   }

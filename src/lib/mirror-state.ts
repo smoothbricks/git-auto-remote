@@ -62,6 +62,7 @@ export type ReviewPendingState = {
   subject: string;
   included: readonly string[];
   review: readonly string[];
+  regenerate: readonly string[];
   outside: readonly string[];
   phase: ReviewPendingPhase;
 };
@@ -86,6 +87,7 @@ export function getReviewPending(): ReviewPendingState | null {
       subject: String(raw.subject ?? ''),
       included: asStringArray(raw.included),
       review: asStringArray(raw.review ?? raw.reviewRequired),
+      regenerate: asStringArray(raw.regenerate),
       outside: asStringArray(raw.outside ?? raw.excluded),
       phase: isPhase(raw.phase) ? raw.phase : 'review-pause',
     };

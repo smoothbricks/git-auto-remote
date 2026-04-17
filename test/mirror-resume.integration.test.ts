@@ -78,10 +78,10 @@ beforeEach(() => {
   git(local, 'remote', 'add', 'upstream', upstream);
   git(local, 'fetch', '-q', 'upstream');
 
-  git(local, 'config', 'fork-remote.upstream.syncPaths', 'packages');
-  git(local, 'config', 'fork-remote.upstream.syncTargetBranch', 'private');
-  git(local, 'config', 'fork-remote.upstream.syncBranch', 'main');
-  git(local, 'config', 'fork-remote.upstream.pushSyncRef', 'false');
+  git(local, 'config', 'auto-remote.upstream.syncPaths', 'packages');
+  git(local, 'config', 'auto-remote.upstream.syncTargetBranch', 'private');
+  git(local, 'config', 'auto-remote.upstream.syncBranch', 'main');
+  git(local, 'config', 'auto-remote.upstream.pushSyncRef', 'false');
 
   // Bootstrap tracking ref to upstream's INITIAL commit.
   const upstreamRoot = git(local, 'rev-list', '--max-parents=0', 'upstream/main');
@@ -190,7 +190,7 @@ describe('sub-case B: review-pause (mixed partial)', () => {
 
   beforeEach(() => {
     // packages/reviewed is a reviewPath: stays OUT of HEAD, overlays to worktree unstaged.
-    git(local, 'config', 'fork-remote.upstream.reviewPaths', 'packages/reviewed');
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/reviewed');
   });
 
   test('pause leaves HEAD with included only, review content in worktree unstaged', async () => {
@@ -305,7 +305,7 @@ describe('sub-case C: pure-review-only commit', () => {
 
   beforeEach(() => {
     // bun.lock is a reviewPath and is NOT under syncPaths (packages).
-    git(local, 'config', 'fork-remote.upstream.reviewPaths', 'bun.lock');
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'bun.lock');
   });
 
   test('pause: HEAD unchanged, bun.lock in worktree unstaged, pending-commit recorded', async () => {

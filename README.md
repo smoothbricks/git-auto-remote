@@ -46,21 +46,23 @@ Opt-in per remote via git config. A remote becomes a "mirror" by setting `syncPa
 
 ```bash
 # In your private clone, treat the 'public' remote as a mirror of packages/:
-git config fork-remote.public.syncPaths "packages"
-git config fork-remote.public.syncTargetBranch "private"
+git config auto-remote.public.syncPaths "packages"
+git config auto-remote.public.syncTargetBranch "private"
 git-auto-remote mirror bootstrap public <sha-whose-tree-matches-current-packages/>
 ```
 
 | Config key | Meaning | Default |
 |---|---|---|
-| `fork-remote.<name>.syncPaths` | Space-separated pathspecs to include when cherry-picking. Presence (either here or via `syncPathsFile`) makes the remote a mirror. | *required* |
-| `fork-remote.<name>.syncPathsFile` | Repo-relative path to a newline-separated file of sync paths. Supports `#` comments. Contents union with `syncPaths`. | *(none)* |
-| `fork-remote.<name>.excludePaths` / `.excludePathsFile` | Pathspecs that are **never** synced, even if under `syncPaths`. Useful for repo-local-only files that live in a shared directory. Dropped silently from the commit; no pause. | *(none)* |
-| `fork-remote.<name>.reviewPaths` / `.reviewPathsFile` | Pathspecs whose changes are **brought into the worktree as unstaged** at pause time so the user can `git add -p` / `git restore` / `git commit --amend --no-edit`. Orthogonal to `syncPaths` — a path may be a reviewPath without being a syncPath. Author + author-date are preserved across amends. | *(none)* |
-| `fork-remote.<name>.syncBranch` | Remote branch to pull from. | `<remote>/HEAD`, else `main` |
-| `fork-remote.<name>.syncTargetBranch` | Local branch that receives replayed commits. | `<remote>` |
-| `fork-remote.<name>.partialHandler` | Path to a script that resolves "partial" commits. | *(none)* |
-| `fork-remote.<name>.pushSyncRef` | Push the tracking ref to the remote after each advance (for CI durability). | `true` |
+| `auto-remote.<name>.syncPaths` | Space-separated pathspecs to include when cherry-picking. Presence (either here or via `syncPathsFile`) makes the remote a mirror. | *required* |
+| `auto-remote.<name>.syncPathsFile` | Repo-relative path to a newline-separated file of sync paths. Supports `#` comments. Contents union with `syncPaths`. | *(none)* |
+| `auto-remote.<name>.excludePaths` / `.excludePathsFile` | Pathspecs that are **never** synced, even if under `syncPaths`. Useful for repo-local-only files that live in a shared directory. Dropped silently from the commit; no pause. | *(none)* |
+| `auto-remote.<name>.reviewPaths` / `.reviewPathsFile` | Pathspecs whose changes are **brought into the worktree as unstaged** at pause time so the user can `git add -p` / `git restore` / `git commit --amend --no-edit`. Orthogonal to `syncPaths` — a path may be a reviewPath without being a syncPath. Author + author-date are preserved across amends. | *(none)* |
+| `auto-remote.<name>.regeneratePaths` / `.regeneratePathsFile` | Pathspecs for **derived** files (bun.lock, generated tsconfig references, etc.) that are dropped from incoming patches and regenerated locally. When a source commit touches any of these, `regenerateCommand` runs after apply and its output is amended into HEAD. | *(none)* |
+| `auto-remote.<name>.regenerateCommand` | Shell command (run via `sh -c`) that produces the regenerate paths from current sources. For nix/devenv repos, wrap with the project shell so tool versions match: `devenv shell -c 'bun i'`. | *(none)* |
+| `auto-remote.<name>.syncBranch` | Remote branch to pull from. | `<remote>/HEAD`, else `main` |
+| `auto-remote.<name>.syncTargetBranch` | Local branch that receives replayed commits. | `<remote>` |
+| `auto-remote.<name>.partialHandler` | Path to a script that resolves "partial" commits. | *(none)* |
+| `auto-remote.<name>.pushSyncRef` | Push the tracking ref to the remote after each advance (for CI durability). | `true` |
 
 ### Per-commit classification
 
@@ -68,16 +70,17 @@ Each changed path in a mirror commit is sorted into exactly ONE bucket, in prior
 
 1. matches `excludePaths` → **dropped entirely** (never in HEAD, never in worktree, not reported)
 2. matches `reviewPaths` → **review** (overlaid to the worktree unstaged at pause time)
-3. matches `syncPaths` → **included** (applied to HEAD by `git am`, author + author-date preserved)
-4. none of the above → **outside** (silently dropped like `excludePaths`, but reported in the pause message so you notice)
+3. matches `regeneratePaths` → **regenerate** (dropped from HEAD; `regenerateCommand` runs after apply and the output is amended into HEAD)
+4. matches `syncPaths` → **included** (applied to HEAD by `git am`, author + author-date preserved)
+5. none of the above → **outside** (silently dropped, reported in the pause message so you notice)
 
-`reviewPaths` is first-class and independent of `syncPaths` — a path can be a reviewPath without being a syncPath. Canonical use: `bun.lock` flagged for review but never auto-synced.
+All three of `reviewPaths`, `regeneratePaths`, `syncPaths` are first-class and independent. Canonical use of `regeneratePaths`: `bun.lock` — when upstream bumps it, we drop their version from the patch and run `bun i` locally to produce our own (matches our package state, avoids binary-file merge pain). Canonical use of `reviewPaths`: `tooling/workspace.gitconfig` — sensitive shared config that deserves a human glance before landing.
 
 | Classification | When | Action |
 |---|---|---|
-| **Out-of-scope** | both `included` and `review` empty (no content for the tool to act on) | commit skipped, tracking ref advances |
-| **Clean** | only `included` non-empty | included in a batched `git am` run |
-| **Partial** | any `review`, any `outside`, or mixed | breaks the batch; paused for review |
+| **Out-of-scope** | `included`, `review`, and `regenerate` all empty | commit skipped, tracking ref advances |
+| **Clean** | `review` and `outside` both empty (may have `included` and/or `regenerate`) | batched `git am`; if `regenerate` non-empty, command runs + amends last commit |
+| **Partial** | `review` or `outside` non-empty | breaks the batch; paused for review |
 
 A batched run of clean + out-of-scope commits is applied via a single `git format-patch ... | git am --empty=drop --3way`.
 
@@ -91,7 +94,8 @@ When a partial is encountered, the tool:
 
 ```
 [mirror public] Partial: feat: shared lib + private glue (abc1234)
-  Review (in worktree, unstaged): bun.lock, tooling/workspace.gitconfig
+  Review (in worktree, unstaged): tooling/workspace.gitconfig
+  Regenerate (auto-produced):     bun.lock
   Outside sync scope (dropped):   privpkgs/foo.ts
 
   Review:    git diff                       # see unstaged review content
@@ -109,8 +113,21 @@ Lines with empty lists are omitted.
 Both commands are unified across three pause sub-cases:
 
 - **am-conflict** — the `included` patch wouldn't apply cleanly; resolve conflicts in the normal `git am` way, then `mirror continue`
-- **review-pause** — `included` landed; `review` awaits in the worktree
+- **review-pause** — `included` landed (with regenerated output if `regenerateCommand` ran); `review` awaits in the worktree
 - **pure-review-pause** — the source touched ONLY review paths, no HEAD commit was made; staging + `mirror continue` creates a fresh commit preserving the source's author/email/date/message
+
+### Regenerate (derived files like bun.lock)
+
+For files that are deterministic from other sources (lockfiles, generated type references, etc.), `regeneratePaths` + `regenerateCommand` drops the upstream version from the patch and produces a local version. Trigger: a source commit touched one of `regeneratePaths`. Behavior: after the patch applies, the command runs (via `sh -c`); any changes it produces inside `regeneratePaths` are staged and amended into HEAD with `--amend --no-edit` (author + author-date preserved). Changes outside `regeneratePaths` are NOT amended and surface as dirty worktree (the tool treats them as a config error but completes the apply).
+
+Example config for a bun-based repo:
+```ini
+[auto-remote "public"]
+	regeneratePaths   = bun.lock
+	regenerateCommand = devenv shell -c 'bun i --frozen-lockfile=false'
+```
+
+The `devenv shell` wrapper ensures `bun` resolves to the project-pinned version regardless of the PATH git inherited (GUI clients, post-applypatch during a bare-terminal `git am --continue`, CI without the dev env activated).
 
 ### Non-interactive mode (CI)
 
@@ -134,7 +151,7 @@ git-auto-remote mirror pull --non-interactive --on-partial ./ci/llm-amend.sh pub
 Or configure it permanently:
 
 ```bash
-git config fork-remote.public.partialHandler /path/to/handler.sh
+git config auto-remote.public.partialHandler /path/to/handler.sh
 ```
 
 The handler is invoked with the partial's subset already applied to HEAD. It may amend HEAD, leave it as-is, or signal skip/punt via exit code:

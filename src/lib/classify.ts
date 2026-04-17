@@ -3,78 +3,94 @@
  * range into clean batches, out-of-scope commits, and partial commits that
  * need human (or handler) review.
  *
- * Each changed path is sorted into exactly ONE of four buckets, in priority order:
+ * Each changed path is sorted into exactly ONE of five buckets, in priority order:
  *
- *   1. matches `excludePaths`  -> dropped entirely (invisible to the rest of the pipeline)
- *   2. matches `reviewPaths`   -> `review`   (brought to worktree unstaged at pause time)
- *   3. matches `syncPaths`     -> `included` (applied to HEAD by `git am`)
- *   4. none of the above       -> `outside`  (the "you forgot about this" bucket; dropped
- *                                              from HEAD and worktree, but surfaced in the
- *                                              pause message so the user can see it)
+ *   1. matches `excludePaths`   -> dropped entirely (invisible to the rest of the pipeline)
+ *   2. matches `reviewPaths`    -> `review`     (brought to worktree unstaged at pause time)
+ *   3. matches `regeneratePaths`-> `regenerate` (dropped from HEAD; a configured command
+ *                                                runs after apply and the command's output
+ *                                                is amended into HEAD with author+author-date
+ *                                                preserved)
+ *   4. matches `syncPaths`      -> `included`   (applied to HEAD by `git am`)
+ *   5. none of the above        -> `outside`    (silently dropped like excludePaths, but
+ *                                                surfaced in the pause message so the user
+ *                                                notices)
  *
- * `reviewPaths` is first-class and independent of `syncPaths`: a path may be a reviewPath
- * WITHOUT also being a syncPath (e.g. bun.lock configured to review but never auto-applied).
+ * All three of {reviewPaths, regeneratePaths, syncPaths} are first-class and orthogonal to
+ * each other. A path in reviewPaths needn't also be in syncPaths. A regeneratePath is
+ * typically NOT in syncPaths (it's an artifact like bun.lock that we don't want from
+ * upstream, we want the one our own regen-command produces).
  *
  * A commit's classification:
  *
- *   included and review both empty    -> out-of-scope (nothing for the tool to do;
- *                                        any `outside` content gets silently dropped
- *                                        with the commit itself)
- *   only `included` non-empty         -> clean (auto-apply)
- *   otherwise                         -> partial (pause for review; three sub-cases
- *                                        distinguished at runtime by mirror-pull.ts)
+ *   all of {included, review, regenerate} empty  -> out-of-scope
+ *     (outside alone doesn't matter: if nothing else is in scope, the whole commit is a
+ *      no-op for this tool; skip it)
+ *
+ *   review and outside both empty                -> clean (auto-proceed)
+ *     (included and/or regenerate may be non-empty; the regen-command runs after apply)
+ *
+ *   otherwise                                    -> partial (pause for review;
+ *                                                  three sub-cases in mirror-pull.ts)
  */
 
 export type PathSpec = {
   syncPaths: readonly string[];
   excludePaths: readonly string[];
   reviewPaths: readonly string[];
+  regeneratePaths: readonly string[];
 };
 
 export type Classification =
   | { kind: 'out-of-scope' }
-  | { kind: 'clean'; included: readonly string[] }
+  | { kind: 'clean'; included: readonly string[]; regenerate: readonly string[] }
   | {
       kind: 'partial';
       included: readonly string[];
       review: readonly string[];
+      regenerate: readonly string[];
       outside: readonly string[];
     };
 
 /**
  * @param changedPaths Paths touched by the commit (from `git diff-tree --name-only`).
- * @param spec         The fork-remote.<name>.* pathspec configuration.
+ * @param spec         The auto-remote.<name>.* pathspec configuration.
  */
 export function classify(changedPaths: readonly string[], spec: PathSpec): Classification {
   const included: string[] = [];
   const review: string[] = [];
+  const regenerate: string[] = [];
   const outside: string[] = [];
 
   for (const p of changedPaths) {
     if (matchesAny(p, spec.excludePaths)) continue; // bucket 1: dropped
     if (matchesAny(p, spec.reviewPaths)) {
-      review.push(p); // bucket 2: review
+      review.push(p); // bucket 2
+      continue;
+    }
+    if (matchesAny(p, spec.regeneratePaths)) {
+      regenerate.push(p); // bucket 3
       continue;
     }
     if (matchesAny(p, spec.syncPaths)) {
-      included.push(p); // bucket 3: included
+      included.push(p); // bucket 4
       continue;
     }
-    outside.push(p); // bucket 4: outside
+    outside.push(p); // bucket 5
   }
 
-  // If there's nothing the tool can actually act on (no included, no review),
-  // the commit is out-of-scope - any `outside` content gets silently dropped
-  // along with the commit. This matches the intuition "if none of this commit
-  // would land in HEAD or in the worktree, don't bother the user".
-  if (included.length === 0 && review.length === 0) {
+  // If there's nothing the tool can act on (no included, no review, no regenerate),
+  // the commit is out-of-scope - any `outside` content gets silently dropped along
+  // with the commit. Matches the intuition "if none of this commit would land in
+  // HEAD or in the worktree, don't bother the user".
+  if (included.length === 0 && review.length === 0 && regenerate.length === 0) {
     return { kind: 'out-of-scope' };
   }
-  // Purely in-scope commit: auto-apply.
+  // Purely in-scope commit (possibly with regenerate content): auto-apply.
   if (review.length === 0 && outside.length === 0) {
-    return { kind: 'clean', included };
+    return { kind: 'clean', included, regenerate };
   }
-  return { kind: 'partial', included, review, outside };
+  return { kind: 'partial', included, review, regenerate, outside };
 }
 
 /** Path-prefix match: `path === spec` or `path` begins with `spec + '/'`. */
@@ -132,3 +148,18 @@ export function segment(commits: readonly ClassifiedCommit[]): readonly Segment[
   flush();
   return segments;
 }
+
+/**
+ * True iff any commit in the list has regenerate-bucket content. Used by
+ * mirror-pull to decide whether to invoke `regenerateCommand` after a range
+ * apply (partials use the commit's own regenerate list directly).
+ */
+export function anyHasRegenerate(commits: readonly ClassifiedCommit[]): boolean {
+  return commits.some((c) => {
+    const k = c.classification.kind;
+    if (k === 'clean') return c.classification.regenerate.length > 0;
+    if (k === 'partial') return c.classification.regenerate.length > 0;
+    return false;
+  });
+}
+
