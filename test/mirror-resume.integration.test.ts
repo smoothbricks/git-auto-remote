@@ -160,6 +160,82 @@ describe('sub-case A: git am conflict', () => {
       expect(code).toBe(1);
     });
   });
+
+  /**
+   * Regression: when `git am` fails structurally BEFORE 3-way merge runs
+   * (e.g. rename source or mode-change target not in HEAD), worktree stays
+   * clean. The tool used to print "Resolve the conflicts, git add, then
+   * mirror continue" which is misleading - there ARE no conflicts and
+   * `git add` has nothing to stage. `mirror continue` would then fail with
+   * "no changes - did you forget to use 'git add'?".
+   *
+   * Expected behaviour (v0.5.1+):
+   *   - Pull emits a DIFFERENT message pointing at `mirror skip` / abort.
+   *   - `mirror continue` on this state returns 1 with its own explanatory
+   *     message (rather than trying git am --continue and spewing git's
+   *     internal error).
+   *   - `mirror skip` works as normal and advances the tracking ref.
+   */
+  describe('structural am failure (no conflict markers to resolve)', () => {
+    /** Push a commit that renames a file which doesn't exist on local HEAD. */
+    function pushRenameOfMissingFile(): string {
+      const seed = join(root, 'seed');
+      // Seed creates `packages/will-be-renamed.ts` then renames it. Since
+      // local doesn't have that file, the rename patch's fake-ancestor build
+      // fails structurally (not via 3-way conflict).
+      writeFileSync(join(seed, 'packages/will-be-renamed.ts'), 'x\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'seed: add file to be renamed');
+      git(seed, 'push', '-q', 'origin', 'main');
+
+      // Rename the file in a subsequent commit.
+      git(seed, 'mv', 'packages/will-be-renamed.ts', 'packages/renamed.ts');
+      git(seed, 'commit', '-q', '-m', 'pkg: rename file');
+      git(seed, 'push', '-q', 'origin', 'main');
+
+      // Advance tracking past the 'seed: add file to be renamed' commit so the
+      // tool thinks that commit is ALREADY synced (it isn't locally, which is
+      // exactly the situation that produces the structural failure).
+      git(local, 'fetch', '-q', 'upstream');
+      const seedCommit = git(seed, 'rev-parse', 'HEAD~1');
+      git(local, 'update-ref', TRACKING, seedCommit);
+      return git(seed, 'rev-parse', 'HEAD');
+    }
+
+    test('pull stops with the structural-failure message; am is in progress but worktree clean', async () => {
+      pushRenameOfMissingFile();
+
+      const code = await mirrorPull({ remote: 'upstream' });
+      // Pull returns 1 (error, not stopped-2), consistent with other am-stop cases.
+      expect(code).toBe(1);
+      // am IS in progress.
+      expect(existsSync(join(local, '.git/rebase-apply'))).toBe(true);
+      // Worktree is clean - no conflict markers to resolve.
+      const status = git(local, 'status', '--porcelain');
+      expect(status).toBe('');
+    });
+
+    test('mirror continue in this state returns 1 without invoking git am --continue', async () => {
+      pushRenameOfMissingFile();
+      await mirrorPull({ remote: 'upstream' });
+
+      // User naively tries continue. With the v0.5.1 guard it short-circuits.
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(1);
+      // am is still in progress (continue did not run git am --continue).
+      expect(existsSync(join(local, '.git/rebase-apply'))).toBe(true);
+    });
+
+    test('mirror skip recovers cleanly', async () => {
+      const renameSha = pushRenameOfMissingFile();
+      await mirrorPull({ remote: 'upstream' });
+
+      const code = await mirrorSkip('upstream');
+      expect(code).toBe(0);
+      expect(existsSync(join(local, '.git/rebase-apply'))).toBe(false);
+      expect(git(local, 'rev-parse', TRACKING)).toBe(renameSha);
+    });
+  });
 });
 
 describe('sub-case B: review-pause (mixed partial)', () => {
@@ -238,10 +314,7 @@ describe('sub-case B: review-pause (mixed partial)', () => {
     expect(git(local, 'show', '-s', '--format=%aI', newHead)).toBe(origAuthorDate);
 
     // Amended commit contains both files.
-    const files = git(local, 'show', '--name-only', '--format=', newHead)
-      .split('\n')
-      .filter(Boolean)
-      .sort();
+    const files = git(local, 'show', '--name-only', '--format=', newHead).split('\n').filter(Boolean).sort();
     expect(files).toEqual(['packages/cli/a.ts', 'packages/reviewed'].sort());
     // Marker cleared.
     expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
@@ -320,16 +393,12 @@ describe('sub-case C: pure-review-only commit', () => {
     // Worktree has bun.lock v2.
     expect(readFileSync(join(local, 'bun.lock'), 'utf8')).toBe('locked v2\n');
     // Review-pending at phase 'pure-review-pause'.
-    const marker = JSON.parse(
-      readFileSync(join(local, '.git/git-auto-remote/review-pending'), 'utf8'),
-    );
+    const marker = JSON.parse(readFileSync(join(local, '.git/git-auto-remote/review-pending'), 'utf8'));
     expect(marker.phase).toBe('pure-review-pause');
     expect(marker.included).toEqual([]);
     expect(marker.review).toEqual(['bun.lock']);
     // Pending-commit metadata written.
-    const pending = JSON.parse(
-      readFileSync(join(local, '.git/git-auto-remote/pending-commit'), 'utf8'),
-    );
+    const pending = JSON.parse(readFileSync(join(local, '.git/git-auto-remote/pending-commit'), 'utf8'));
     expect(pending.sourceSha).toBe(sourceSha);
     expect(pending.message).toBe('chore: bump bun.lock');
     expect(pending.authorName).toBe('Test');

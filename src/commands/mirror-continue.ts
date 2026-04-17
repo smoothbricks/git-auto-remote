@@ -1,11 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { applyReviewToWorktree } from '../lib/apply.js';
-import {
-  amInProgress,
-  gitTry,
-  hasStagedChanges,
-  workingTreeDirty,
-} from '../lib/git.js';
+import { amInProgress, gitTry, hasStagedChanges, hasUnresolvedMergeConflicts, workingTreeDirty } from '../lib/git.js';
 import { getMirrorConfig } from '../lib/mirror-config.js';
 import {
   clearMirrorInProgress,
@@ -53,9 +48,7 @@ export async function mirrorContinue(remoteArg?: string): Promise<number> {
   }
   const remote = remoteArg ?? review.remote;
   if (remote !== review.remote) {
-    console.error(
-      `[git-auto-remote] Pending review is for '${review.remote}', not '${remote}'.`,
-    );
+    console.error(`[git-auto-remote] Pending review is for '${review.remote}', not '${remote}'.`);
     return 1;
   }
 
@@ -81,16 +74,26 @@ async function continueAm(remoteArg?: string): Promise<number> {
   const sentinelRemote = getMirrorInProgress();
   const remote = sentinelRemote ?? remoteArg;
   if (!remote) {
-    console.error(
-      `[git-auto-remote] 'git am' is in progress but no mirror sentinel set and no remote given.`,
-    );
+    console.error(`[git-auto-remote] 'git am' is in progress but no mirror sentinel set and no remote given.`);
     console.error(`Usage: git-auto-remote mirror continue <remote>`);
     return 1;
   }
   if (remoteArg && sentinelRemote && sentinelRemote !== remoteArg) {
-    console.error(
-      `[git-auto-remote] sentinel says am is for '${sentinelRemote}', not '${remoteArg}'.`,
-    );
+    console.error(`[git-auto-remote] sentinel says am is for '${sentinelRemote}', not '${remoteArg}'.`);
+    return 1;
+  }
+
+  // If am stopped structurally (not via 3-way conflict) - no merge markers
+  // AND no staged content to commit - `git am --continue` would fail with
+  // "no changes - did you forget to use 'git add'?" which misleads the user
+  // into hunting for nonexistent conflicts. Redirect them to `mirror skip`.
+  if (!hasUnresolvedMergeConflicts() && !hasStagedChanges()) {
+    console.error(`[mirror ${remote}] 'git am' is in progress but there are no conflict markers to resolve`);
+    console.error(`[mirror ${remote}]   and nothing is staged. The patch likely references content missing`);
+    console.error(`[mirror ${remote}]   from HEAD (rename source, mode change, etc.). Recover with:`);
+    console.error(`    git-auto-remote mirror skip ${remote}   # drop this commit, continue replay`);
+    console.error(`    git am --show-current-patch=diff          # inspect the failing patch`);
+    console.error(`    git am --abort                            # bail out entirely`);
     return 1;
   }
 
@@ -126,10 +129,7 @@ async function continueAm(remoteArg?: string): Promise<number> {
  * Transition from am-in-progress to review-pause: overlay the review subset to
  * the working tree unstaged and pause for the user to stage/discard.
  */
-async function postAmTransition(
-  remote: string,
-  reviewState: ReviewPendingState,
-): Promise<number> {
+async function postAmTransition(remote: string, reviewState: ReviewPendingState): Promise<number> {
   if (reviewState.review.length === 0) {
     // No review content to overlay; just resume.
     clearReviewPending();
@@ -139,9 +139,7 @@ async function postAmTransition(
   const excludePaths = mirror?.excludePaths ?? [];
   const overlay = applyReviewToWorktree(reviewState.sourceSha, reviewState.review, excludePaths);
   if (overlay === 'conflict') {
-    console.error(
-      `[mirror ${remote}]   (some review-path hunks left conflict markers; resolve before continuing)`,
-    );
+    console.error(`[mirror ${remote}]   (some review-path hunks left conflict markers; resolve before continuing)`);
   } else if (overlay === 'error') {
     console.error(
       `[mirror ${remote}]   (failed to overlay review paths; inspect with: git show ${reviewState.sourceSha.slice(0, 8)})`,
@@ -169,10 +167,7 @@ async function postAmTransition(
  * date is refreshed by git). Then discard unstaged review leftovers and
  * resume the sync.
  */
-async function continueReviewPause(
-  remote: string,
-  reviewPaths: readonly string[],
-): Promise<number> {
+async function continueReviewPause(remote: string, reviewPaths: readonly string[]): Promise<number> {
   if (hasStagedChanges()) {
     // Amend HEAD: --no-edit keeps author name/email, author-date, and the
     // commit message; committer date is unavoidably refreshed by git.
@@ -202,10 +197,7 @@ async function continueReviewPause(
  * (via GIT_AUTHOR_* env vars). Otherwise no-op (Q2a: silent skip-equivalent).
  * Tracking ref was already advanced to source SHA when the pause was entered.
  */
-async function continuePureReviewPause(
-  remote: string,
-  reviewPaths: readonly string[],
-): Promise<number> {
+async function continuePureReviewPause(remote: string, reviewPaths: readonly string[]): Promise<number> {
   const pending = getPendingCommit();
   if (hasStagedChanges()) {
     if (!pending) {
