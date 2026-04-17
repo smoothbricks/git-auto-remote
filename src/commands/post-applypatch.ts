@@ -24,9 +24,10 @@ export function postApplypatch(): number {
   const next = Number.parseInt(readFileSync(nextPath, 'utf8').trim(), 10);
   if (!Number.isFinite(next) || next < 1) return 0;
 
-  // post-applypatch fires AFTER a successful apply, and git has already advanced
-  // the "next" counter to the next patch. So the patch we just applied is at (next - 1).
-  const justApplied = next - 1;
+  // Git fires post-applypatch AFTER the apply/commit but BEFORE bumping the
+  // "next" counter, so at hook time `next` holds the patch that was just
+  // applied (verified empirically with next=last=1 for a single-patch run).
+  const justApplied = next;
   const patchFile = join(applyDir, String(justApplied).padStart(4, '0'));
   if (!existsSync(patchFile)) return 0;
 
@@ -41,13 +42,13 @@ export function postApplypatch(): number {
     // Best-effort: never fail the hook and stop the am run.
   }
 
-  // If this patch is the last one of our run, clear the sentinel. Works for
-  // both clean ranges and conflict-resolution continues: on the last patch
-  // `next` has already been incremented past `last`.
+  // If this patch IS the last one of the run, clear the sentinel. At hook
+  // time `next` is the just-applied patch number (see above), so `next == last`
+  // means we just applied the final patch.
   const lastPath = join(applyDir, 'last');
   if (existsSync(lastPath)) {
     const last = Number.parseInt(readFileSync(lastPath, 'utf8').trim(), 10);
-    if (Number.isFinite(last) && next > last) {
+    if (Number.isFinite(last) && next >= last) {
       try {
         clearMirrorInProgress();
       } catch {
