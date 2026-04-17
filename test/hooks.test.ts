@@ -36,8 +36,10 @@ describe('installHook', () => {
       expect(content).toContain('git-auto-remote post-checkout');
       // Start marker is formatted as `>>> git-auto-remote <hook> <version> >>>`.
       expect(content).toMatch(/>>> git-auto-remote post-checkout\s+\S+ >>>/);
-      // bunx call is version-pinned so hooks run the installer's version line.
-      expect(content).toMatch(/bunx --bun git-auto-remote@\d+\.\d+\.x post-checkout/);
+      // bunx call is pinned to the installer's EXACT version so there's no
+      // ambiguity in bunx's version resolution. Wildcard forms like 0.3.x
+      // misbehave in bunx (silently run an unresolved package).
+      expect(content).toMatch(/bunx --bun git-auto-remote@\d+\.\d+\.\d+ post-checkout/);
     });
 
     test('makes the hook file executable', () => {
@@ -78,7 +80,7 @@ describe('installHook', () => {
       const after = readFileSync(join(repoDir, '.git/hooks/post-checkout'), 'utf8');
       // Old marker gone, new (versioned, pinned) snippet in its place.
       expect(after).not.toContain('git-auto-remote post-checkout "$@"');
-      expect(after).toMatch(/bunx --bun git-auto-remote@\d+\.\d+\.x post-checkout/);
+      expect(after).toMatch(/bunx --bun git-auto-remote@\d+\.\d+\.\d+ post-checkout/);
       expect(after).toContain('#!/usr/bin/env bash');
     });
   });
