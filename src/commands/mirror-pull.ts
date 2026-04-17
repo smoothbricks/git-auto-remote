@@ -178,8 +178,10 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
           return 2;
         }
         console.error(
-          `[mirror ${mirror.remote}] Conflict during apply. Resolve with 'git am --continue' or 'git am --abort', then re-run 'mirror pull'.`,
+          `[mirror ${mirror.remote}] Conflict during apply. Resolve the conflicts, git add, then one of:`,
         );
+        console.error(`    git-auto-remote mirror am-continue ${mirror.remote}`);
+        console.error(`    git-auto-remote mirror am-skip     ${mirror.remote}   # drop this commit`);
         return 1;
       }
       if (result === 'error') {
@@ -280,8 +282,10 @@ async function handlePartial(
         return { kind: 'stopped' };
       }
       console.error(
-        `[mirror ${mirror.remote}] Conflict applying partial. Resolve with git am, then re-run mirror pull.`,
+        `[mirror ${mirror.remote}] Conflict applying partial. Resolve the conflicts, git add, then one of:`,
       );
+      console.error(`    git-auto-remote mirror am-continue ${mirror.remote}`);
+      console.error(`    git-auto-remote mirror am-skip     ${mirror.remote}   # drop this commit`);
       return { kind: 'error' };
     }
     return { kind: 'error' };

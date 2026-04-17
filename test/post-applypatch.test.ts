@@ -40,12 +40,17 @@ function seedCommit(): string {
   return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8' }).trim();
 }
 
+/**
+ * Write a fake `.git/rebase-apply/` matching the state git leaves when it
+ * fires post-applypatch AFTER applying the patch numbered `next` but BEFORE
+ * bumping the counter. The patch file is placed at `<next>` zero-padded to 4.
+ */
 function writeRebaseApply(sha: string, next: number, last: number): string {
   const dir = join(repoDir, '.git', 'rebase-apply');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'next'), `${next}\n`);
   writeFileSync(join(dir, 'last'), `${last}\n`);
-  const patchNum = String(next - 1).padStart(4, '0');
+  const patchNum = String(next).padStart(4, '0');
   writeFileSync(
     join(dir, patchNum),
     `From ${sha} Mon Sep 17 00:00:00 2001\nFrom: t <t@t>\nSubject: [PATCH] x\n\n---\n`,
@@ -56,7 +61,7 @@ function writeRebaseApply(sha: string, next: number, last: number): string {
 describe('postApplypatch', () => {
   test('no-ops when sentinel is absent', () => {
     const sha = seedCommit();
-    writeRebaseApply(sha, 2, 1);
+    writeRebaseApply(sha, 1, 1);
     const code = postApplypatch();
     expect(code).toBe(0);
     // Tracking ref not created.
@@ -67,24 +72,23 @@ describe('postApplypatch', () => {
     expect(refList.trim()).toBe('');
   });
 
-  test('updates tracking ref to From-SHA of just-applied patch', () => {
+  test('updates tracking ref to From-SHA of just-applied patch (mid-run)', () => {
     const sha = seedCommit();
-    // Set sentinel
     mkdirSync(join(repoDir, '.git/git-auto-remote'), { recursive: true });
     writeFileSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'), 'upstream');
-    writeRebaseApply(sha, 2, 3); // next=2, last=3 -> we are in the middle of a 3-patch run
+    // Mid-run of a 3-patch am: git just applied patch 2, next=2 (not yet bumped), last=3.
+    writeRebaseApply(sha, 2, 3);
 
     const code = postApplypatch();
     expect(code).toBe(0);
 
-    const trackingSha = execFileSync(
-      'git',
-      ['rev-parse', TRACKING_UPSTREAM],
-      { cwd: repoDir, encoding: 'utf8' },
-    ).trim();
+    const trackingSha = execFileSync('git', ['rev-parse', TRACKING_UPSTREAM], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    }).trim();
     expect(trackingSha).toBe(sha);
 
-    // Sentinel still present - we're not yet on the last patch.
+    // Sentinel still present - we're not yet on the last patch (next=2 < last=3).
     expect(existsSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'))).toBe(true);
   });
 
@@ -95,12 +99,10 @@ describe('postApplypatch', () => {
       cwd: repoDir,
     });
 
-    // First, the hook reads via getMirrorInProgress... but to exercise
-    // readTrackingRef path, we piggyback on the existing "advance + clear"
-    // flow: set sentinel, run hook with next=2 last=1 -> advance + clear.
     mkdirSync(join(repoDir, '.git/git-auto-remote'), { recursive: true });
     writeFileSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'), 'upstream');
-    writeRebaseApply(sha, 2, 1);
+    // Single-patch am: next=1, last=1 -> hook both advances ref and clears sentinel.
+    writeRebaseApply(sha, 1, 1);
 
     postApplypatch();
 
@@ -120,12 +122,12 @@ describe('postApplypatch', () => {
     expect(legacyCheck.exitCode).not.toBe(0);
   });
 
-  test('clears the sentinel when this is the last patch (next > last)', () => {
+  test('clears the sentinel when this is the last patch (next == last)', () => {
     const sha = seedCommit();
     mkdirSync(join(repoDir, '.git/git-auto-remote'), { recursive: true });
     writeFileSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'), 'upstream');
-    // last=1, next=2 -> we just applied patch 1 of 1, the run is done.
-    writeRebaseApply(sha, 2, 1);
+    // Single-patch am at hook time: next=1 (just applied, not yet bumped), last=1.
+    writeRebaseApply(sha, 1, 1);
 
     const code = postApplypatch();
     expect(code).toBe(0);
