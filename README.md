@@ -103,19 +103,21 @@ When a partial is encountered, the tool:
   Review:   git diff                              # see unstaged review content
   Stage:    git add -p                            # pick hunks into the commit
   Discard:  git restore <paths>                   # drop review hunks
-  Dropped:  git-auto-remote mirror diff public       # source-vs-HEAD, sync-domain scoped
-  Show:     git-auto-remote mirror source public     # full 'git show' of the source commit
+  Diff:     git-auto-remote mirror diff             # what source changed that didn't land in HEAD
+  Show:     git-auto-remote mirror source           # full 'git show' of the source commit
 
-  Continue: git-auto-remote mirror continue public
-  Skip:     git-auto-remote mirror skip public
+  Continue: git-auto-remote mirror continue
+  Skip:     git-auto-remote mirror skip
 ```
 
 Lines with empty lists are omitted. All SHAs use an 8-char short form throughout the tool's output.
 
-- `mirror diff <remote>` — `git diff HEAD <sourceSha>` filtered to the tool's sync domain (syncPaths ∪ reviewPaths ∪ regeneratePaths, plus the source commit's outside set, minus excludePaths). Use this as the primary "what does the source have that I don't?" lookup. Flags: `--include-excluded` keeps excluded paths in the diff; `--raw` bypasses the positive filter entirely.
-- `mirror source <remote>` — `git show <sourceSha>` for the paused source commit. Convenience so you don't have to copy the SHA out of the pause header.
-- `mirror continue <remote>` — if you staged any review hunks, amends HEAD with them (author + author-date preserved by `--amend --no-edit`); any leftover unstaged review content is discarded. Resumes the sync from there.
-- `mirror skip <remote>` — discards the worktree overlay and resets HEAD past the partial commit. Tracking ref already points past the source SHA, so the next pull resumes past it too.
+During a pause the remote name is omitted from the displayed commands (only one pause can be active at a time; the tool resolves the remote from the review-pending marker). The CLI still accepts an explicit `<remote>` positional for scripting.
+
+- `mirror diff [<remote>]` — shows `git diff HEAD <sourceSha>` scoped to the paths THIS source commit touched in review/regenerate/outside buckets (not the full sync domain). `--raw` bypasses the filter for a full unfiltered diff. Forwards other args (`--stat`, `--name-only`, etc.) to `git diff`.
+- `mirror source [<remote>]` — `git show <sourceSha>` for the paused source commit. Convenience so you don't have to copy the SHA out of the pause header. Forwards other args to `git show`.
+- `mirror continue [<remote>]` — if you staged any review hunks, amends HEAD with them (author + author-date preserved by `--amend --no-edit`); any leftover unstaged review content is discarded. Resumes the sync from there.
+- `mirror skip [<remote>]` — discards the worktree overlay and resets HEAD past the partial commit. Tracking ref already points past the source SHA, so the next pull resumes past it too.
 
 Both commands are unified across three pause sub-cases:
 
@@ -201,10 +203,12 @@ git-auto-remote mirror bootstrap <remote> <sha> [--force]
 git-auto-remote mirror pull [<remote>] [--non-interactive] [--on-partial <cmd>]
 git-auto-remote mirror continue [<remote>]     # resolve any pause sub-case
 git-auto-remote mirror skip [<remote>]         # skip the paused commit
-git-auto-remote mirror diff [<remote>] [--include-excluded] [--raw]
+git-auto-remote mirror diff [<remote>] [--raw] [git-diff-args...]
                                                 # during a pause: show source-vs-HEAD diff
-                                                # filtered to the sync domain
-git-auto-remote mirror source [<remote>]       # during a pause: `git show <sourceSha>`
+                                                # scoped to paths THIS commit touched in
+                                                # review/regenerate/outside buckets
+git-auto-remote mirror source [<remote>] [git-show-args...]
+                                                # during a pause: `git show <sourceSha>`
 ```
 
 ## Bypassing auto-routing on push

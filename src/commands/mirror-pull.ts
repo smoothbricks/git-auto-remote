@@ -609,20 +609,25 @@ function printAmStopMessage(remote: string): void {
     ? `${stuckSha.slice(0, 8)}  ${commitSubject(stuckSha) || '(unknown subject)'}`
     : 'current patch';
 
+  // The displayed `mirror continue`/`mirror skip` commands intentionally omit
+  // the remote argument: during a pause there's only one active pause state,
+  // so the tool resolves the remote from the review-pending marker. The CLI
+  // still accepts an explicit positional for scripting, just not advertised
+  // here.
   if (hasUnresolvedMergeConflicts()) {
     console.error(`[mirror ${remote}] Conflict applying ${stuckLabel}`);
     console.error(`[mirror ${remote}]   Resolve the conflicts, git add, then one of:`);
-    console.error(`    git-auto-remote mirror continue ${remote}`);
-    console.error(`    git-auto-remote mirror skip     ${remote}   # drop this commit`);
+    console.error(`    git-auto-remote mirror continue`);
+    console.error(`    git-auto-remote mirror skip       # drop this commit`);
     return;
   }
   console.error(`[mirror ${remote}] Stopped structurally on ${stuckLabel}`);
   console.error(`[mirror ${remote}]   The patch references content missing from HEAD (e.g. a rename from a path`);
   console.error(`[mirror ${remote}]   not present, or a mode change on a file that wasn't synced). Working tree`);
   console.error(`[mirror ${remote}]   is clean; there are no conflict markers to resolve.`);
-  console.error(`    git-auto-remote mirror skip     ${remote}   # drop this commit and continue`);
-  console.error(`    git am --show-current-patch=diff              # inspect the failing patch`);
-  console.error(`    git am --abort                                # bail out entirely`);
+  console.error(`    git-auto-remote mirror skip              # drop this commit and continue`);
+  console.error(`    git am --show-current-patch=diff         # inspect the failing patch`);
+  console.error(`    git am --abort                           # bail out entirely`);
 }
 
 /**
@@ -689,12 +694,18 @@ function printPartialHeader(
  * applicable, then the `mirror diff`/`mirror source`/`mirror continue`/
  * `mirror skip` command surface.
  *
- * `mirror diff` shows the source-vs-HEAD diff filtered to the sync domain
- * (syncPaths ∪ reviewPaths ∪ regeneratePaths ∪ source's outside set, minus
- * excludePaths) - i.e. only the paths the tool considered relevant to the
- * sync, excluding purely-private paths the user doesn't want to review.
+ * `mirror diff` shows only what the SOURCE COMMIT changed that didn't land
+ * cleanly in HEAD - scoped to the review, regenerate, and outside buckets of
+ * this specific commit's classification. Paths in the mirror's syncPaths
+ * that happen to have drifted between HEAD and source for unrelated reasons
+ * do NOT appear (unless `mirror diff --raw` is used to bypass the filter).
+ *
+ * The displayed commands intentionally omit the remote argument: during a
+ * pause there's only one active pause state, so the tool resolves the remote
+ * from the review-pending marker. The CLI still accepts an explicit
+ * positional for scripting - it's just not advertised in this footer.
  */
-function printPartialFooter(remote: string, hasReview: boolean, sourceSha: string, sourceSubject: string): void {
+function printPartialFooter(_remote: string, hasReview: boolean, sourceSha: string, sourceSubject: string): void {
   const short = sourceSha.slice(0, 8);
   console.error(``);
   console.error(`  Source:   ${short}  ${sourceSubject}`);
@@ -704,11 +715,11 @@ function printPartialFooter(remote: string, hasReview: boolean, sourceSha: strin
     console.error(`  Stage:    git add -p                            # pick hunks into the commit`);
     console.error(`  Discard:  git restore <paths>                   # drop review hunks`);
   }
-  console.error(`  Dropped:  git-auto-remote mirror diff ${remote}       # source-vs-HEAD, sync-domain scoped`);
-  console.error(`  Show:     git-auto-remote mirror source ${remote}     # full 'git show' of the source commit`);
+  console.error(`  Diff:     git-auto-remote mirror diff             # what source changed that didn't land in HEAD`);
+  console.error(`  Show:     git-auto-remote mirror source           # full 'git show' of the source commit`);
   console.error(``);
-  console.error(`  Continue: git-auto-remote mirror continue ${remote}`);
-  console.error(`  Skip:     git-auto-remote mirror skip ${remote}`);
+  console.error(`  Continue: git-auto-remote mirror continue`);
+  console.error(`  Skip:     git-auto-remote mirror skip`);
 }
 
 /**

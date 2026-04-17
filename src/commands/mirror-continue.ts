@@ -172,7 +172,8 @@ async function postAmTransition(remote: string, reviewState: ReviewPendingState)
   if (reviewState.outside.length > 0) {
     console.error(`  Outside sync scope (dropped):   ${reviewState.outside.join(', ')}`);
   }
-  // Footer: matches printPartialFooter format.
+  // Footer: matches printPartialFooter format. Commands omit the remote arg
+  // since only one pause is active at a time.
   console.error(``);
   console.error(`  Source:   ${short}  ${reviewState.subject}`);
   console.error(``);
@@ -181,11 +182,11 @@ async function postAmTransition(remote: string, reviewState: ReviewPendingState)
     console.error(`  Stage:    git add -p                            # pick hunks into the commit`);
     console.error(`  Discard:  git restore <paths>                   # drop review hunks`);
   }
-  console.error(`  Dropped:  git-auto-remote mirror diff ${remote}       # source-vs-HEAD, sync-domain scoped`);
-  console.error(`  Show:     git-auto-remote mirror source ${remote}     # full 'git show' of the source commit`);
+  console.error(`  Diff:     git-auto-remote mirror diff             # what source changed that didn't land in HEAD`);
+  console.error(`  Show:     git-auto-remote mirror source           # full 'git show' of the source commit`);
   console.error(``);
-  console.error(`  Continue: git-auto-remote mirror continue ${remote}`);
-  console.error(`  Skip:     git-auto-remote mirror skip ${remote}`);
+  console.error(`  Continue: git-auto-remote mirror continue`);
+  console.error(`  Skip:     git-auto-remote mirror skip`);
   return 0;
 }
 
