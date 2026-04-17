@@ -273,3 +273,86 @@ describe('mirror pull with --on-partial handler', () => {
     expect(code).toBe(2);
   });
 });
+
+describe('mirror pull with reviewPaths', () => {
+  beforeEach(() => {
+    // A commit on upstream that ONLY touches a review-required path.
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/gitconfig'), 'v2\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'chore: bump gitconfig');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    git(local, 'config', 'fork-remote.upstream.reviewPaths', 'packages/gitconfig');
+  });
+
+  test('treats a commit touching only a reviewPath as partial (pause for review)', async () => {
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0); // paused cleanly
+    // Review marker written
+    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
+  });
+});
+
+describe('mirror pull with excludePaths', () => {
+  beforeEach(() => {
+    // A commit touching a shared path AND a to-be-excluded path.
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A v2\n');
+    mkdirSync(join(seed, 'packages/internal'), { recursive: true });
+    writeFileSync(join(seed, 'packages/internal/secret.ts'), 'do not mirror\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'feat: bump A and add internal secret');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    git(local, 'config', 'fork-remote.upstream.excludePaths', 'packages/internal');
+  });
+
+  test('excluded paths are dropped entirely: the commit is classified clean and auto-applied', async () => {
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0);
+    // Partial commit should NOT have been recorded - the excluded path drops out of both
+    // `included` and `excluded` during classification.
+    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+    // a.ts change landed
+    const aContent = require('node:fs').readFileSync(join(local, 'packages/cli/a.ts'), 'utf8');
+    expect(aContent).toBe('pkg A v2\n');
+    // internal/secret.ts must NOT have been copied into local
+    expect(existsSync(join(local, 'packages/internal/secret.ts'))).toBe(false);
+  });
+});
+
+describe('mirror pull with root commits on the mirror', () => {
+  test("can replay the mirror's root commit (regression: format-patch first^..last)", async () => {
+    // Build a fresh pair where we DO NOT bootstrap from upstream's tip; instead
+    // we bootstrap the tracking ref to a commit on an unrelated history (local's
+    // root) so that rev-list tracking..upstream/main includes upstream's root.
+    const upstreamRoot = git(join(root, 'seed'), 'rev-list', '--max-parents=0', 'HEAD');
+    const localRoot = git(local, 'rev-list', '--max-parents=0', 'private');
+
+    // Point tracking ref at local's root (unrelated to upstream history).
+    git(local, 'update-ref', 'refs/git-auto-remote/mirror/upstream', localRoot);
+
+    // Confirm rev-list now includes upstream's root.
+    const rangeOut = git(
+      local,
+      'rev-list',
+      '--reverse',
+      `${localRoot}..upstream/main`,
+    ).split('\n');
+    expect(rangeOut[0]).toBe(upstreamRoot); // first commit in range IS the root
+
+    // The replay should succeed - the fix switches `format-patch first^..last` to
+    // an explicit SHA list, which works even when `first` has no parent.
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0);
+
+    // The root commit's content (packages/cli/a.ts from pkg:add A) should have
+    // landed on local via the replay (local already had it from its own root,
+    // so an empty patch was dropped - the important assertion is that no error
+    // surfaced from `format-patch root^..`).
+    expect(existsSync(join(local, 'packages/cli/a.ts'))).toBe(true);
+  });
+});

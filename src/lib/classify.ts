@@ -3,43 +3,65 @@
  * range into clean batches, out-of-scope commits, and partial commits that
  * need human (or handler) review.
  *
- * A commit's paths are partitioned against the mirror's syncPaths allowlist:
- *   included = paths inside syncPaths
- *   excluded = paths outside syncPaths
+ * Each changed path falls into one of three buckets:
  *
- *   included.length === 0                    -> out-of-scope (skip)
- *   excluded.length === 0 && included.length -> clean        (apply in range)
- *   both non-empty                           -> partial      (breaks the range)
+ *   excludePaths (highest priority) -> dropped entirely: not included, not excluded.
+ *                                      Never makes it into the patch.
+ *   syncPaths                       -> included
+ *   neither                         -> excluded (leaks private content if synced)
+ *
+ * A commit's classification:
+ *
+ *   no included paths                                       -> out-of-scope
+ *   all included, none excluded, no review-required         -> clean
+ *   otherwise (any excluded OR any review-required included) -> partial
+ *
+ * `reviewPaths` is a subset of paths within `included` whose changes should
+ * always trigger a review pause, even when no excluded paths are touched.
+ * Useful for shared files that are sensitive (e.g. workspace git config).
  */
+
+export type PathSpec = {
+  syncPaths: readonly string[];
+  excludePaths: readonly string[];
+  reviewPaths: readonly string[];
+};
 
 export type Classification =
   | { kind: 'out-of-scope' }
   | { kind: 'clean'; included: readonly string[] }
-  | { kind: 'partial'; included: readonly string[]; excluded: readonly string[] };
+  | {
+      kind: 'partial';
+      included: readonly string[];
+      excluded: readonly string[];
+      reviewRequired: readonly string[];
+    };
 
 /**
- * @param changedPaths  Paths touched by the commit (from `git diff-tree --name-only`).
- * @param syncPaths     The allowlist from `fork-remote.<name>.syncPaths`. Matched as a
- *                      path prefix: `syncPaths=["packages"]` matches `packages/x` and
- *                      the bare `packages` file/dir itself, but not `packages-rc`.
+ * @param changedPaths Paths touched by the commit (from `git diff-tree --name-only`).
+ * @param spec         The fork-remote.<name>.* pathspec configuration.
  */
-export function classify(
-  changedPaths: readonly string[],
-  syncPaths: readonly string[],
-): Classification {
+export function classify(changedPaths: readonly string[], spec: PathSpec): Classification {
   const included: string[] = [];
   const excluded: string[] = [];
   for (const p of changedPaths) {
-    if (isInSyncPaths(p, syncPaths)) included.push(p);
+    if (matchesAny(p, spec.excludePaths)) continue; // dropped entirely
+    if (matchesAny(p, spec.syncPaths)) included.push(p);
     else excluded.push(p);
   }
+
   if (included.length === 0) return { kind: 'out-of-scope' };
-  if (excluded.length === 0) return { kind: 'clean', included };
-  return { kind: 'partial', included, excluded };
+
+  const reviewRequired = included.filter((p) => matchesAny(p, spec.reviewPaths));
+  if (excluded.length === 0 && reviewRequired.length === 0) {
+    return { kind: 'clean', included };
+  }
+  return { kind: 'partial', included, excluded, reviewRequired };
 }
 
-function isInSyncPaths(path: string, syncPaths: readonly string[]): boolean {
-  return syncPaths.some((sp) => path === sp || path.startsWith(sp + '/'));
+/** Path-prefix match: `path === spec` or `path` begins with `spec + '/'`. */
+function matchesAny(path: string, specs: readonly string[]): boolean {
+  return specs.some((s) => path === s || path.startsWith(s + '/'));
 }
 
 /**

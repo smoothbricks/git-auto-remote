@@ -5,33 +5,50 @@ import type { ClassifiedCommit } from './classify.js';
 /**
  * Apply a range of clean/out-of-scope commits via `git format-patch | git am`.
  *
- *   git format-patch <first>^..<last> --stdout -- <syncPaths>  |  git am --empty=drop --3way
+ *   git format-patch --stdout <sha1> <sha2> ... -- <syncPaths> :(exclude)...  |  git am --empty=drop --3way
  *
  * Out-of-scope commits produce empty patches and are dropped by `--empty=drop`.
+ * Paths matching `excludePaths` are filtered out at the patch-generation stage
+ * via git's `:(exclude)` pathspec magic.
+ *
+ * Unlike the range form `first^..last`, passing explicit SHAs works even when
+ * `first` is a root commit (no `^` parent), which is essential for replaying
+ * a full history on first-time bootstrap.
  *
  * @returns
- *   'applied'  - entire range applied cleanly
+ *   'applied'  - entire batch applied cleanly
  *   'conflict' - git am stopped mid-range; `.git/rebase-apply` is still present
  *   'error'    - something unexpected (e.g. git missing, malformed patch)
  */
 export function applyRange(
   commits: readonly ClassifiedCommit[],
   syncPaths: readonly string[],
+  excludePaths: readonly string[] = [],
 ): 'applied' | 'conflict' | 'error' {
   if (commits.length === 0) return 'applied';
 
-  const first = commits[0].sha;
-  const last = commits[commits.length - 1].sha;
+  const pathspec = [...syncPaths, ...excludePaths.map((p) => `:(exclude)${p}`)];
 
-  const formatArgs = ['format-patch', `${first}^..${last}`, '--stdout', '--', ...syncPaths];
-  let patchBuf: Buffer;
-  try {
-    patchBuf = execFileSync('git', formatArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-  } catch {
-    return 'error';
+  // Generate one patch per commit. We can't pass all SHAs in a single
+  // `format-patch --stdout <shas>` because that form treats each argument as
+  // "emit patches from upstream default up to this SHA" rather than "just this
+  // SHA". `-1 <sha>` reliably emits exactly one patch and works for root
+  // commits (where `<sha>^..<sha>` would fail).
+  const chunks: Buffer[] = [];
+  for (const c of commits) {
+    try {
+      chunks.push(
+        execFileSync('git', ['format-patch', '-1', '--stdout', c.sha, '--', ...pathspec], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }),
+      );
+    } catch {
+      return 'error';
+    }
   }
+  const patchBuf = Buffer.concat(chunks);
 
-  // All patches are empty (pathspec excluded everything) -> nothing to do
+  // All patches empty (pathspec matched nothing) -> nothing to do.
   if (patchBuf.length === 0) return 'applied';
 
   const amResult = spawnSync('git', ['am', '--empty=drop', '--3way'], {
@@ -40,20 +57,21 @@ export function applyRange(
   });
 
   if (amResult.status === 0) return 'applied';
-  // `git am` stops mid-range on conflict and leaves .git/rebase-apply/
   if (amInProgress()) return 'conflict';
   return 'error';
 }
 
-/**
- * Apply a single partial commit's in-scope changes. Same mechanism as a range
- * of length 1, but separated for clarity and for per-partial output formatting.
- */
+/** Apply a single partial commit's in-scope changes. */
 export function applyPartial(
   sha: string,
   syncPaths: readonly string[],
+  excludePaths: readonly string[] = [],
 ): 'applied' | 'conflict' | 'error' {
-  return applyRange([{ sha, classification: { kind: 'clean', included: [] } }], syncPaths);
+  return applyRange(
+    [{ sha, classification: { kind: 'clean', included: [] } }],
+    syncPaths,
+    excludePaths,
+  );
 }
 
 /** Pretty-print "Applying: <subject>" lines, mimicking `git am`'s own output. */

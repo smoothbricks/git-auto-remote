@@ -42,6 +42,7 @@ export type ReviewPendingState = {
   subject: string;
   included: readonly string[];
   excluded: readonly string[];
+  reviewRequired: readonly string[];
 };
 
 export function setReviewPending(state: ReviewPendingState): void {

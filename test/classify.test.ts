@@ -1,28 +1,37 @@
 import { describe, expect, test } from 'bun:test';
-import { classify, segment, type ClassifiedCommit } from '../src/lib/classify.js';
+import { classify, segment, type ClassifiedCommit, type PathSpec } from '../src/lib/classify.js';
+
+const spec = (
+  syncPaths: string[] = [],
+  excludePaths: string[] = [],
+  reviewPaths: string[] = [],
+): PathSpec => ({ syncPaths, excludePaths, reviewPaths });
 
 describe('classify', () => {
   describe('when no paths fall inside syncPaths', () => {
     test('returns out-of-scope', () => {
-      expect(classify(['README.md', 'package.json'], ['packages'])).toEqual({ kind: 'out-of-scope' });
+      expect(classify(['README.md', 'package.json'], spec(['packages']))).toEqual({
+        kind: 'out-of-scope',
+      });
     });
 
     test('returns out-of-scope for a commit with no changes', () => {
-      expect(classify([], ['packages'])).toEqual({ kind: 'out-of-scope' });
+      expect(classify([], spec(['packages']))).toEqual({ kind: 'out-of-scope' });
     });
   });
 
   describe('when all paths are inside syncPaths', () => {
     test('returns clean', () => {
-      expect(classify(['packages/cli/foo.ts', 'packages/mdx/bar.ts'], ['packages'])).toEqual({
+      expect(
+        classify(['packages/cli/foo.ts', 'packages/mdx/bar.ts'], spec(['packages'])),
+      ).toEqual({
         kind: 'clean',
         included: ['packages/cli/foo.ts', 'packages/mdx/bar.ts'],
       });
     });
 
     test('a bare sync path (no slash) matches exactly', () => {
-      // A file exactly named "packages" at root - edge case, but we should match it
-      expect(classify(['packages'], ['packages'])).toEqual({
+      expect(classify(['packages'], spec(['packages']))).toEqual({
         kind: 'clean',
         included: ['packages'],
       });
@@ -30,44 +39,120 @@ describe('classify', () => {
   });
 
   describe('when paths straddle syncPaths and outside', () => {
-    test('returns partial with both lists populated', () => {
+    test('returns partial with both lists populated and empty reviewRequired', () => {
       expect(
         classify(
           ['packages/cli/foo.ts', 'privpkgs/secret.ts', 'package.json'],
-          ['packages'],
+          spec(['packages']),
         ),
       ).toEqual({
         kind: 'partial',
         included: ['packages/cli/foo.ts'],
         excluded: ['privpkgs/secret.ts', 'package.json'],
+        reviewRequired: [],
+      });
+    });
+  });
+
+  describe('excludePaths', () => {
+    test('a path matching both sync and exclude is dropped entirely', () => {
+      // tooling/sync-with-public.sh lives under 'tooling' (sync) but is
+      // explicitly excluded - a commit touching only it is out-of-scope.
+      expect(
+        classify(
+          ['tooling/sync-with-public.sh'],
+          spec(['tooling'], ['tooling/sync-with-public.sh']),
+        ),
+      ).toEqual({ kind: 'out-of-scope' });
+    });
+
+    test('exclude takes precedence even when mixed with included paths', () => {
+      const result = classify(
+        ['tooling/other.sh', 'tooling/sync-with-public.sh'],
+        spec(['tooling'], ['tooling/sync-with-public.sh']),
+      );
+      expect(result).toEqual({
+        kind: 'clean',
+        included: ['tooling/other.sh'],
+      });
+    });
+
+    test('exclude does not cause partial classification (it is dropped, not excluded)', () => {
+      // Regression: an excluded path must not show up in `excluded[]`, otherwise
+      // every commit touching it + a synced path would be a spurious partial.
+      const result = classify(
+        ['packages/x.ts', 'tooling/sync-with-public.sh'],
+        spec(['packages', 'tooling'], ['tooling/sync-with-public.sh']),
+      );
+      expect(result).toEqual({ kind: 'clean', included: ['packages/x.ts'] });
+    });
+  });
+
+  describe('reviewPaths', () => {
+    test('a clean-looking commit that touches a reviewPath is classified partial', () => {
+      expect(
+        classify(
+          ['tooling/workspace.gitconfig'],
+          spec(['tooling'], [], ['tooling/workspace.gitconfig']),
+        ),
+      ).toEqual({
+        kind: 'partial',
+        included: ['tooling/workspace.gitconfig'],
+        excluded: [],
+        reviewRequired: ['tooling/workspace.gitconfig'],
+      });
+    });
+
+    test('reviewPath contributions show up in reviewRequired list', () => {
+      const result = classify(
+        ['packages/a.ts', 'tooling/workspace.gitconfig'],
+        spec(['packages', 'tooling'], [], ['tooling/workspace.gitconfig']),
+      );
+      expect(result).toEqual({
+        kind: 'partial',
+        included: ['packages/a.ts', 'tooling/workspace.gitconfig'],
+        excluded: [],
+        reviewRequired: ['tooling/workspace.gitconfig'],
+      });
+    });
+
+    test('reviewRequired can coexist with excluded paths in one commit', () => {
+      expect(
+        classify(
+          ['packages/a.ts', 'tooling/workspace.gitconfig', 'privpkgs/x.ts'],
+          spec(['packages', 'tooling'], [], ['tooling/workspace.gitconfig']),
+        ),
+      ).toEqual({
+        kind: 'partial',
+        included: ['packages/a.ts', 'tooling/workspace.gitconfig'],
+        excluded: ['privpkgs/x.ts'],
+        reviewRequired: ['tooling/workspace.gitconfig'],
       });
     });
   });
 
   describe('prefix matching precision', () => {
     test('does not false-match partial directory names', () => {
-      // "packages-rc/x" must NOT match syncPaths=["packages"]
-      expect(classify(['packages-rc/x.ts'], ['packages'])).toEqual({
-        kind: 'out-of-scope',
-      });
+      expect(classify(['packages-rc/x.ts'], spec(['packages']))).toEqual({ kind: 'out-of-scope' });
     });
 
     test('supports multiple syncPaths', () => {
       expect(
-        classify(['packages/cli/a.ts', 'tooling/b.sh', 'README.md'], ['packages', 'tooling']),
+        classify(['packages/cli/a.ts', 'tooling/b.sh', 'README.md'], spec(['packages', 'tooling'])),
       ).toEqual({
         kind: 'partial',
         included: ['packages/cli/a.ts', 'tooling/b.sh'],
         excluded: ['README.md'],
+        reviewRequired: [],
       });
     });
 
     test('treats subdir pathspec strictly', () => {
-      expect(classify(['tooling/direnv/a.sh'], ['tooling/direnv'])).toEqual({
+      expect(classify(['tooling/direnv/a.sh'], spec(['tooling/direnv']))).toEqual({
         kind: 'clean',
         included: ['tooling/direnv/a.sh'],
       });
-      expect(classify(['tooling/other/a.sh'], ['tooling/direnv'])).toEqual({
+      expect(classify(['tooling/other/a.sh'], spec(['tooling/direnv']))).toEqual({
         kind: 'out-of-scope',
       });
     });
@@ -85,7 +170,12 @@ describe('segment', () => {
   });
   const partial = (sha: string): ClassifiedCommit => ({
     sha,
-    classification: { kind: 'partial', included: ['packages/x.ts'], excluded: ['README.md'] },
+    classification: {
+      kind: 'partial',
+      included: ['packages/x.ts'],
+      excluded: ['README.md'],
+      reviewRequired: [],
+    },
   });
 
   test('empty input produces no segments', () => {
@@ -99,8 +189,6 @@ describe('segment', () => {
   });
 
   test('out-of-scope commits are absorbed into a surrounding range', () => {
-    // out-of-scope commits produce empty patches; git am --empty=drop handles them.
-    // So from the segmenter's perspective, they just stay in the range.
     const result = segment([clean('a'), out('b'), clean('c')]);
     expect(result).toHaveLength(1);
     expect(result[0].kind).toBe('range');

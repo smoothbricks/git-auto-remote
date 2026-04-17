@@ -9,6 +9,7 @@ import {
   currentBranch,
   fetchRemote,
   git,
+  gitTry,
   isAncestorOf,
   listCommitsInRange,
   revParse,
@@ -123,19 +124,36 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     return 0;
   }
   if (!isAncestorOf(last, head)) {
-    console.error(
-      `[mirror ${mirror.remote}] Tracking ref ${last.slice(0, 8)} is not an ancestor of ${head.slice(0, 8)}.`,
-    );
-    console.error(`  The mirror was likely force-pushed. Re-bootstrap with:`);
-    console.error(`    git-auto-remote mirror bootstrap ${mirror.remote} <sha>`);
-    return 1;
+    // Distinguish "force-push" from "intentional cross-history bootstrap":
+    //   - If the two commits share any merge-base, they were once on the same
+    //     history line and `last` has fallen off -> force-push, refuse.
+    //   - If they have no merge-base, `last` is on a disjoint history (e.g. a
+    //     commit from the local side bootstrapped into the mirror's tracking
+    //     ref) -> cross-history bootstrap, proceed and replay everything.
+    const mergeBase = gitTry('merge-base', last, head);
+    if (mergeBase) {
+      console.error(
+        `[mirror ${mirror.remote}] Tracking ref ${last.slice(0, 8)} is not an ancestor of ${head.slice(0, 8)}.`,
+      );
+      console.error(`  The mirror was likely force-pushed. Re-bootstrap with:`);
+      console.error(`    git-auto-remote mirror bootstrap ${mirror.remote} <sha>`);
+      return 1;
+    }
+    // No common ancestor: tracking ref is on a disjoint history (typical for
+    // first-time bootstrap across a fork boundary). Everything on the mirror
+    // is "new" relative to tracking - that's exactly what we want to replay.
   }
 
   // Enumerate + classify commits.
+  const pathSpec = {
+    syncPaths: mirror.syncPaths,
+    excludePaths: mirror.excludePaths,
+    reviewPaths: mirror.reviewPaths,
+  };
   const shas = listCommitsInRange(last, head);
   const classified: ClassifiedCommit[] = shas.map((sha) => ({
     sha,
-    classification: classify(changedPaths(sha), mirror.syncPaths),
+    classification: classify(changedPaths(sha), pathSpec),
   }));
   const segments = segment(classified);
 
@@ -146,7 +164,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     if (seg.kind === 'range') {
       printApplyingLines(seg.commits, mirror.remote);
       setMirrorInProgress(mirror.remote);
-      const result = applyRange(seg.commits, mirror.syncPaths);
+      const result = applyRange(seg.commits, mirror.syncPaths, mirror.excludePaths);
       clearMirrorInProgress();
       if (result === 'conflict') {
         // `git am` stopped; leave it for the user (or abort in CI mode).
@@ -222,12 +240,17 @@ async function handlePartial(
   options: MirrorPullOptions,
 ): Promise<PartialResult> {
   if (commit.classification.kind !== 'partial') return { kind: 'error' };
-  const { included, excluded } = commit.classification;
+  const { included, excluded, reviewRequired } = commit.classification;
   const subject = commitSubject(commit.sha);
   const handler = options.onPartial ?? mirror.partialHandler;
 
   console.error(`[mirror ${mirror.remote}] Partial: ${subject} (${commit.sha.slice(0, 8)})`);
-  console.error(`  Excluded paths: ${excluded.join(', ')}`);
+  if (excluded.length > 0) {
+    console.error(`  Excluded paths: ${excluded.join(', ')}`);
+  }
+  if (reviewRequired.length > 0) {
+    console.error(`  Review-required paths: ${reviewRequired.join(', ')}`);
+  }
 
   // In --non-interactive mode without a handler, do NOT apply. Advancing the
   // ref here would silently lose the commit on the next run; leaving both HEAD
@@ -242,7 +265,7 @@ async function handlePartial(
 
   // Apply the in-scope subset.
   setMirrorInProgress(mirror.remote);
-  const applyResult = applyPartial(commit.sha, mirror.syncPaths);
+  const applyResult = applyPartial(commit.sha, mirror.syncPaths, mirror.excludePaths);
   clearMirrorInProgress();
   if (applyResult !== 'applied') {
     if (applyResult === 'conflict') {
@@ -307,6 +330,7 @@ async function handlePartial(
     subject,
     included,
     excluded,
+    reviewRequired,
   });
   console.error(``);
   console.error(`  Review:    git show HEAD`);
