@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 
 /**
  * Thin wrapper around `git` invocations.
@@ -87,4 +89,50 @@ export function configGet(key: string): string | null {
 /** Set a git config value. */
 export function configSet(key: string, value: string): void {
   git('config', key, value);
+}
+
+/** Add a git config value to a multi-value key. */
+export function configAdd(key: string, value: string): void {
+  git('config', '--add', key, value);
+}
+
+/** Return all values for a multi-value config key (empty list if unset). */
+export function configGetAll(key: string): string[] {
+  const out = gitTry('config', '--get-all', key);
+  return out ? out.split('\n').filter((l) => l.length > 0) : [];
+}
+
+/** True when `.git/rebase-apply/` exists (i.e. `git am` is in progress). */
+export function amInProgress(): boolean {
+  return existsSync(join(gitDir(), 'rebase-apply'));
+}
+
+/** True when the working tree has uncommitted changes (staged or unstaged). */
+export function workingTreeDirty(): boolean {
+  const out = gitTry('status', '--porcelain');
+  return out !== null && out.length > 0;
+}
+
+/** SHAs of commits in the range `from..to`, oldest-first (topological order). */
+export function listCommitsInRange(from: string, to: string): string[] {
+  const out = gitTry('rev-list', '--reverse', '--topo-order', `${from}..${to}`);
+  if (!out) return [];
+  return out.split('\n').filter((line) => line.length > 0);
+}
+
+/** Paths changed by a single commit (`git diff-tree --name-only`). */
+export function changedPaths(sha: string): string[] {
+  const out = gitTry('diff-tree', '--no-commit-id', '--name-only', '-r', sha);
+  if (!out) return [];
+  return out.split('\n').filter((line) => line.length > 0);
+}
+
+/** Subject line of a commit. */
+export function commitSubject(sha: string): string {
+  return gitTry('log', '-1', '--format=%s', sha) ?? '';
+}
+
+/** Quiet `git fetch <remote>`; throws GitError on failure. */
+export function fetchRemote(remote: string): void {
+  git('fetch', '--quiet', remote);
 }

@@ -2,20 +2,35 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { join } from 'node:path';
 import { gitDir } from './git.js';
 
-export type HookName = 'post-checkout' | 'pre-push';
+export type HookName = 'post-checkout' | 'pre-push' | 'post-merge' | 'post-applypatch';
+
+export const ALL_HOOKS: readonly HookName[] = [
+  'post-checkout',
+  'pre-push',
+  'post-merge',
+  'post-applypatch',
+];
+
+/**
+ * Exit-code behavior per hook:
+ *   post-checkout   - never fail a checkout (auto-routing is best-effort)
+ *   post-merge      - never fail a pull (mirror sync is best-effort)
+ *   post-applypatch - never fail `git am` (ref-advancement is best-effort)
+ *   pre-push        - propagate exit code (it's a safety gate)
+ */
+function exitBehavior(name: HookName): string {
+  return name === 'pre-push' ? '|| exit $?' : '|| true';
+}
 
 /**
  * Shell snippet injected into hook files. The string `git-auto-remote <hook>` is the
  * marker used to detect our presence in existing hooks (for chainability and idempotence).
  */
 function hookSnippet(name: HookName): string {
-  // post-checkout must never fail the checkout - auto-routing is best-effort.
-  // pre-push must propagate the exit code - it's a safety gate.
-  const exitBehavior = name === 'pre-push' ? '|| exit $?' : '|| true';
   return [
     `# >>> git-auto-remote ${name} >>>`,
     `# Managed by git-auto-remote. Safe to chain with other hooks above/below these markers.`,
-    `bunx --bun git-auto-remote ${name} "$@" ${exitBehavior}`,
+    `bunx --bun git-auto-remote ${name} "$@" ${exitBehavior(name)}`,
     `# <<< git-auto-remote ${name} <<<`,
   ].join('\n');
 }

@@ -1,7 +1,7 @@
-import { uninstallHook } from '../lib/hooks.js';
+import { ALL_HOOKS, uninstallHook } from '../lib/hooks.js';
 
 export function uninstall(): number {
-  for (const hook of ['post-checkout', 'pre-push'] as const) {
+  for (const hook of ALL_HOOKS) {
     const result = uninstallHook(hook);
     switch (result.kind) {
       case 'removed':
