@@ -30,13 +30,13 @@ Pre-push verifies the push belongs to the target remote's history; cross-fork pu
 
 Decision rules:
 
-| Situation | Action |
-|---|---|
-| No remotes configured | No-op |
-| All remotes share the same root set | Inherit parent branch's pushRemote |
-| Remotes have disjoint roots, branch matches exactly one | Route to that remote |
-| Branch matches zero remotes | No-op (silent) |
-| Branch matches two or more remotes | Refuse to auto-configure, warn |
+| Situation                                               | Action                             |
+| ------------------------------------------------------- | ---------------------------------- |
+| No remotes configured                                   | No-op                              |
+| All remotes share the same root set                     | Inherit parent branch's pushRemote |
+| Remotes have disjoint roots, branch matches exactly one | Route to that remote               |
+| Branch matches zero remotes                             | No-op (silent)                     |
+| Branch matches two or more remotes                      | Refuse to auto-configure, warn     |
 
 Any manually configured `branch.<name>.pushRemote` is always respected.
 
@@ -51,18 +51,18 @@ git config auto-remote.public.syncTargetBranch "private"
 git-auto-remote mirror bootstrap public <sha-whose-tree-matches-current-packages/>
 ```
 
-| Config key | Meaning | Default |
-|---|---|---|
-| `auto-remote.<name>.syncPaths` | Space-separated pathspecs to include when cherry-picking. Presence (either here or via `syncPathsFile`) makes the remote a mirror. | *required* |
-| `auto-remote.<name>.syncPathsFile` | Repo-relative path to a newline-separated file of sync paths. Supports `#` comments. Contents union with `syncPaths`. | *(none)* |
-| `auto-remote.<name>.excludePaths` / `.excludePathsFile` | Pathspecs that are **never** synced, even if under `syncPaths`. Useful for repo-local-only files that live in a shared directory. Dropped silently from the commit; no pause. | *(none)* |
-| `auto-remote.<name>.reviewPaths` / `.reviewPathsFile` | Pathspecs whose changes are **brought into the worktree as unstaged** at pause time so the user can `git add -p` / `git restore` / `git commit --amend --no-edit`. Orthogonal to `syncPaths` — a path may be a reviewPath without being a syncPath. Author + author-date are preserved across amends. | *(none)* |
-| `auto-remote.<name>.regeneratePaths` / `.regeneratePathsFile` | Pathspecs for **derived** files (bun.lock, generated tsconfig references, etc.) that are dropped from incoming patches and regenerated locally. When a source commit touches any of these, `regenerateCommand` runs after apply and its output is amended into HEAD. | *(none)* |
-| `auto-remote.<name>.regenerateCommand` | Shell command (run via `sh -c`) that produces the regenerate paths from current sources. For nix/devenv repos, wrap with the project shell so tool versions match: `devenv shell -c 'bun i'`. | *(none)* |
-| `auto-remote.<name>.syncBranch` | Remote branch to pull from. | `<remote>/HEAD`, else `main` |
-| `auto-remote.<name>.syncTargetBranch` | Local branch that receives replayed commits. | `<remote>` |
-| `auto-remote.<name>.partialHandler` | Path to a script that resolves "partial" commits. | *(none)* |
-| `auto-remote.<name>.pushSyncRef` | Push the tracking ref to the remote after each advance (for CI durability). | `true` |
+| Config key                                                    | Meaning                                                                                                                                                                                                                                                                                               | Default                      |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| `auto-remote.<name>.syncPaths`                                | Space-separated pathspecs to include when cherry-picking. Presence (either here or via `syncPathsFile`) makes the remote a mirror.                                                                                                                                                                    | _required_                   |
+| `auto-remote.<name>.syncPathsFile`                            | Repo-relative path to a newline-separated file of sync paths. Supports `#` comments. Contents union with `syncPaths`.                                                                                                                                                                                 | _(none)_                     |
+| `auto-remote.<name>.excludePaths` / `.excludePathsFile`       | Pathspecs that are **never** synced, even if under `syncPaths`. Useful for repo-local-only files that live in a shared directory. Dropped silently from the commit; no pause.                                                                                                                         | _(none)_                     |
+| `auto-remote.<name>.reviewPaths` / `.reviewPathsFile`         | Pathspecs whose changes are **brought into the worktree as unstaged** at pause time so the user can `git add -p` / `git restore` / `git commit --amend --no-edit`. Orthogonal to `syncPaths` — a path may be a reviewPath without being a syncPath. Author + author-date are preserved across amends. | _(none)_                     |
+| `auto-remote.<name>.regeneratePaths` / `.regeneratePathsFile` | Pathspecs for **derived** files (bun.lock, generated tsconfig references, etc.) that are dropped from incoming patches and regenerated locally. When a source commit touches any of these, `regenerateCommand` runs after apply and its output is amended into HEAD.                                  | _(none)_                     |
+| `auto-remote.<name>.regenerateCommand`                        | Shell command (run via `sh -c`) that produces the regenerate paths from current sources. For nix/devenv repos, wrap with the project shell so tool versions match: `devenv shell -c 'bun i'`.                                                                                                         | _(none)_                     |
+| `auto-remote.<name>.syncBranch`                               | Remote branch to pull from.                                                                                                                                                                                                                                                                           | `<remote>/HEAD`, else `main` |
+| `auto-remote.<name>.syncTargetBranch`                         | Local branch that receives replayed commits.                                                                                                                                                                                                                                                          | `<remote>`                   |
+| `auto-remote.<name>.partialHandler`                           | Path to a script that resolves "partial" commits.                                                                                                                                                                                                                                                     | _(none)_                     |
+| `auto-remote.<name>.pushSyncRef`                              | Push the tracking ref to the remote after each advance (for CI durability).                                                                                                                                                                                                                           | `true`                       |
 
 ### Per-commit classification
 
@@ -76,11 +76,11 @@ Each changed path in a mirror commit is sorted into exactly ONE bucket, in prior
 
 All three of `reviewPaths`, `regeneratePaths`, `syncPaths` are first-class and independent. Canonical use of `regeneratePaths`: `bun.lock` — when upstream bumps it, we drop their version from the patch and run `bun i` locally to produce our own (matches our package state, avoids binary-file merge pain). Canonical use of `reviewPaths`: `tooling/workspace.gitconfig` — sensitive shared config that deserves a human glance before landing.
 
-| Classification | When | Action |
-|---|---|---|
-| **Out-of-scope** | `included`, `review`, and `regenerate` all empty | commit skipped, tracking ref advances |
-| **Clean** | `review` and `outside` both empty (may have `included` and/or `regenerate`) | batched `git am`; if `regenerate` non-empty, command runs + amends last commit |
-| **Partial** | `review` or `outside` non-empty | breaks the batch; paused for review |
+| Classification   | When                                                                        | Action                                                                         |
+| ---------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| **Out-of-scope** | `included`, `review`, and `regenerate` all empty                            | commit skipped, tracking ref advances                                          |
+| **Clean**        | `review` and `outside` both empty (may have `included` and/or `regenerate`) | batched `git am`; if `regenerate` non-empty, command runs + amends last commit |
+| **Partial**      | `review` or `outside` non-empty                                             | breaks the batch; paused for review                                            |
 
 A batched run of clean + out-of-scope commits is applied via a single `git format-patch ... | git am --empty=drop --3way`.
 
@@ -93,20 +93,27 @@ When a partial is encountered, the tool:
 3. Pauses for review.
 
 ```
-[mirror public] Partial: feat: shared lib + private glue (abc1234)
+[mirror public] Partial:  abc12345  feat: shared lib + private glue
   Review (in worktree, unstaged): tooling/workspace.gitconfig
   Regenerate (auto-produced):     bun.lock
   Outside sync scope (dropped):   privpkgs/foo.ts
 
-  Review:    git diff                       # see unstaged review content
-  Stage:     git add -p                     # pick hunks into the commit
-  Discard:   git restore <paths>            # drop review hunks
-  Continue:  git-auto-remote mirror continue public
-  Skip:      git-auto-remote mirror skip public
+  Source:   abc12345  feat: shared lib + private glue
+
+  Review:   git diff                              # see unstaged review content
+  Stage:    git add -p                            # pick hunks into the commit
+  Discard:  git restore <paths>                   # drop review hunks
+  Dropped:  git-auto-remote mirror diff public       # source-vs-HEAD, sync-domain scoped
+  Show:     git-auto-remote mirror source public     # full 'git show' of the source commit
+
+  Continue: git-auto-remote mirror continue public
+  Skip:     git-auto-remote mirror skip public
 ```
 
-Lines with empty lists are omitted.
+Lines with empty lists are omitted. All SHAs use an 8-char short form throughout the tool's output.
 
+- `mirror diff <remote>` — `git diff HEAD <sourceSha>` filtered to the tool's sync domain (syncPaths ∪ reviewPaths ∪ regeneratePaths, plus the source commit's outside set, minus excludePaths). Use this as the primary "what does the source have that I don't?" lookup. Flags: `--include-excluded` keeps excluded paths in the diff; `--raw` bypasses the positive filter entirely.
+- `mirror source <remote>` — `git show <sourceSha>` for the paused source commit. Convenience so you don't have to copy the SHA out of the pause header.
 - `mirror continue <remote>` — if you staged any review hunks, amends HEAD with them (author + author-date preserved by `--amend --no-edit`); any leftover unstaged review content is discarded. Resumes the sync from there.
 - `mirror skip <remote>` — discards the worktree overlay and resets HEAD past the partial commit. Tracking ref already points past the source SHA, so the next pull resumes past it too.
 
@@ -121,6 +128,7 @@ Both commands are unified across three pause sub-cases:
 For files that are deterministic from other sources (lockfiles, generated type references, etc.), `regeneratePaths` + `regenerateCommand` drops the upstream version from the patch and produces a local version. Trigger: a source commit touched one of `regeneratePaths`. Behavior: after the patch applies, the command runs (via `sh -c`); any changes it produces inside `regeneratePaths` are staged and amended into HEAD with `--amend --no-edit` (author + author-date preserved). Changes outside `regeneratePaths` are NOT amended and surface as dirty worktree (the tool treats them as a config error but completes the apply).
 
 Example config for a bun-based repo:
+
 ```ini
 [auto-remote "public"]
 	regeneratePaths   = bun.lock
@@ -133,12 +141,12 @@ The `devenv shell` wrapper ensures `bun` resolves to the project-pinned version 
 
 `mirror pull --non-interactive` never pauses for a human:
 
-| Situation | Behavior | Exit code |
-|---|---|---|
-| Up to date | no-op | 0 |
-| Only clean commits | all applied | 0 |
-| Partial encountered, no handler | nothing applied, ref unchanged (so CI surfaces it again) | 2 |
-| Conflict in a clean commit | `git am --abort`, exit | 2 |
+| Situation                       | Behavior                                                 | Exit code |
+| ------------------------------- | -------------------------------------------------------- | --------- |
+| Up to date                      | no-op                                                    | 0         |
+| Only clean commits              | all applied                                              | 0         |
+| Partial encountered, no handler | nothing applied, ref unchanged (so CI surfaces it again) | 2         |
+| Conflict in a clean commit      | `git am --abort`, exit                                   | 2         |
 
 ### Scripted partial resolution (`--on-partial`)
 
@@ -156,11 +164,11 @@ git config auto-remote.public.partialHandler /path/to/handler.sh
 
 The handler is invoked with the partial's subset already applied to HEAD. It may amend HEAD, leave it as-is, or signal skip/punt via exit code:
 
-| Exit code | Meaning | Tool response |
-|---|---|---|
-| 0 | Resolved; HEAD is the answer | Continue sync |
-| 2 | Skip this commit | `git reset --hard HEAD~1`; ref advances past; continue |
-| any other | Punt (can't decide) | Interactive: pause for human. Non-interactive: rewind HEAD + ref, exit 2 |
+| Exit code | Meaning                      | Tool response                                                            |
+| --------- | ---------------------------- | ------------------------------------------------------------------------ |
+| 0         | Resolved; HEAD is the answer | Continue sync                                                            |
+| 2         | Skip this commit             | `git reset --hard HEAD~1`; ref advances past; continue                   |
+| any other | Punt (can't decide)          | Interactive: pause for human. Non-interactive: rewind HEAD + ref, exit 2 |
 
 Handler receives the following env vars:
 
@@ -193,6 +201,10 @@ git-auto-remote mirror bootstrap <remote> <sha> [--force]
 git-auto-remote mirror pull [<remote>] [--non-interactive] [--on-partial <cmd>]
 git-auto-remote mirror continue [<remote>]     # resolve any pause sub-case
 git-auto-remote mirror skip [<remote>]         # skip the paused commit
+git-auto-remote mirror diff [<remote>] [--include-excluded] [--raw]
+                                                # during a pause: show source-vs-HEAD diff
+                                                # filtered to the sync domain
+git-auto-remote mirror source [<remote>]       # during a pause: `git show <sourceSha>`
 ```
 
 ## Bypassing auto-routing on push

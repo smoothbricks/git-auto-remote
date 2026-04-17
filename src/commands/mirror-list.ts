@@ -16,7 +16,7 @@ export function mirrorList(): number {
     console.log(`  syncTargetBranch:  ${m.syncTargetBranch}`);
     console.log(`  partialHandler:    ${m.partialHandler ?? '(none)'}`);
     console.log(`  pushSyncRef:       ${m.pushSyncRef}`);
-    console.log(`  tracking:          ${tracking ? tracking.slice(0, 12) : '(not bootstrapped)'}`);
+    console.log(`  tracking:          ${tracking ? tracking.slice(0, 8) : '(not bootstrapped)'}`);
   }
   return 0;
 }

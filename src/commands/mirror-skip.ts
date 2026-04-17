@@ -50,14 +50,14 @@ export async function mirrorSkip(remoteArg?: string): Promise<number> {
     gitTry('clean', '-fd', '--', ...review.review);
     git('reset', '--hard', 'HEAD~1');
     clearReviewPending();
-    console.error(`[git-auto-remote] Skipped ${review.sourceSha.slice(0, 8)} (${review.subject}); resuming.`);
+    console.error(`[mirror ${remote}] Skipped:  ${review.sourceSha.slice(0, 8)}  ${review.subject}`);
     return mirrorPull({ remote });
   }
   if (review.phase === 'pure-review-pause') {
     discardReviewPaths(review.review);
     clearPendingCommit();
     clearReviewPending();
-    console.error(`[git-auto-remote] Skipped ${review.sourceSha.slice(0, 8)} (${review.subject}); resuming.`);
+    console.error(`[mirror ${remote}] Skipped:  ${review.sourceSha.slice(0, 8)}  ${review.subject}`);
     return mirrorPull({ remote });
   }
   // phase === 'am-in-progress' but am is not in progress anymore. Treat as if
@@ -111,7 +111,7 @@ async function skipAm(remoteArg?: string): Promise<number> {
   }
 
   updateTrackingRef(remote, skipSha);
-  console.error(`[mirror ${remote}] skipped ${skipSha.slice(0, 8)}${subject ? ` (${subject})` : ''}`);
+  console.error(`[mirror ${remote}] Skipped:  ${skipSha.slice(0, 8)}${subject ? `  ${subject}` : ''}`);
 
   if (amInProgress()) {
     console.error(

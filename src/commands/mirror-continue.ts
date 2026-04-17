@@ -160,17 +160,32 @@ async function postAmTransition(remote: string, reviewState: ReviewPendingState)
     console.error(`[mirror ${remote}]    each review path, not just this commit's change. Stage what you want.)`);
   }
   setReviewPending({ ...reviewState, phase: 'review-pause' });
-  console.error(`[mirror ${remote}] Partial: ${reviewState.subject} (${reviewState.sourceSha.slice(0, 8)})`);
-  console.error(`  Review (in worktree, unstaged): ${reviewState.review.join(', ')}`);
+  const short = reviewState.sourceSha.slice(0, 8);
+  // Header: matches printPartialHeader format in mirror-pull.ts ('<sha>  <subject>').
+  console.error(`[mirror ${remote}] Partial:  ${short}  ${reviewState.subject}`);
+  if (reviewState.review.length > 0) {
+    console.error(`  Review (in worktree, unstaged): ${reviewState.review.join(', ')}`);
+  }
+  if (reviewState.regenerate.length > 0) {
+    console.error(`  Regenerate (auto-produced):     ${reviewState.regenerate.join(', ')}`);
+  }
   if (reviewState.outside.length > 0) {
     console.error(`  Outside sync scope (dropped):   ${reviewState.outside.join(', ')}`);
   }
+  // Footer: matches printPartialFooter format.
   console.error(``);
-  console.error(`  Review:    git diff                       # see unstaged review content`);
-  console.error(`  Stage:     git add -p                     # pick hunks into the commit`);
-  console.error(`  Discard:   git restore <paths>            # drop review hunks`);
-  console.error(`  Continue:  git-auto-remote mirror continue ${remote}`);
-  console.error(`  Skip:      git-auto-remote mirror skip ${remote}`);
+  console.error(`  Source:   ${short}  ${reviewState.subject}`);
+  console.error(``);
+  if (reviewState.review.length > 0) {
+    console.error(`  Review:   git diff                              # see unstaged review content`);
+    console.error(`  Stage:    git add -p                            # pick hunks into the commit`);
+    console.error(`  Discard:  git restore <paths>                   # drop review hunks`);
+  }
+  console.error(`  Dropped:  git-auto-remote mirror diff ${remote}       # source-vs-HEAD, sync-domain scoped`);
+  console.error(`  Show:     git-auto-remote mirror source ${remote}     # full 'git show' of the source commit`);
+  console.error(``);
+  console.error(`  Continue: git-auto-remote mirror continue ${remote}`);
+  console.error(`  Skip:     git-auto-remote mirror skip ${remote}`);
   return 0;
 }
 

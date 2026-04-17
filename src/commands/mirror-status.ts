@@ -19,7 +19,7 @@ export function mirrorStatus(remoteArg?: string): number {
   }
   const review = getReviewPending();
   if (review) {
-    console.log(`review-pending: ${review.remote} ${review.sourceSha.slice(0, 12)} (${review.subject})`);
+    console.log(`review-pending: ${review.remote} ${review.sourceSha.slice(0, 8)} (${review.subject})`);
   }
   console.log('');
 
@@ -41,8 +41,8 @@ export function mirrorStatus(remoteArg?: string): number {
           : null;
 
     console.log(`${m.remote} (target: ${m.syncTargetBranch}, paths: ${m.syncPaths.join(' ')})`);
-    console.log(`  tracking:  ${tracking ? tracking.slice(0, 12) : '(not bootstrapped)'}`);
-    console.log(`  remote:    ${remoteTip ? remoteTip.slice(0, 12) : '(not fetched)'}`);
+    console.log(`  tracking:  ${tracking ? tracking.slice(0, 8) : '(not bootstrapped)'}`);
+    console.log(`  remote:    ${remoteTip ? remoteTip.slice(0, 8) : '(not fetched)'}`);
     if (behind === null) {
       if (!remoteTip) {
         console.log('  behind:    unknown (not fetched)');
