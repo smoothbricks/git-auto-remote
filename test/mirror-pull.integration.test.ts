@@ -423,21 +423,22 @@ describe('mirror pull with root commits on the mirror', () => {
   });
 
   /**
-   * v0.5.3 regression: when the tracking ref IS a root commit (bootstrap at
-   * the very first commit of the mirror's history, for a "fresh clone with
-   * no prior content" setup), the root commit's own content must land on
-   * local HEAD. Before this fix, `listCommitsInRange(<root>, <head>)` used
-   * `<root>..<head>` which EXCLUDED the root - so every file the mirror
-   * created in its root commit was missing from local's HEAD, and any
-   * subsequent commit that modified those files hit modify/delete conflicts.
+   * v0.5.4: a fresh clone with NO tracking ref set should full-replay the
+   * mirror from its root. No `mirror bootstrap` call required.
+   *
+   * Pre-0.5.4 history of this test: v0.5.3 tried to fix the root problem by
+   * bootstrap-at-root + prepending the root during replay. That regressed
+   * the resume-past-root case (infinite loop: prepend re-fired every
+   * iteration since tracking-at-root stays as-is until the root applies).
+   * The cleaner redesign is that bootstrap is OPT-IN for skip-ahead; the
+   * default is full-history replay from no tracking ref.
    */
-  test('bootstrap at a root commit INCLUDES the root in the replay', async () => {
+  test('mirror pull with no tracking ref does a full-history replay from the mirror root', async () => {
     // Build a fresh "empty-scaffold local" that lacks the mirror's root content.
     const freshLocal = join(root, 'fresh-local');
     git(root, 'init', '-q', freshLocal);
     // Seed with an unrelated scaffold commit so local has a HEAD that's on
     // a different history line from upstream's root.
-    mkdirSync(join(freshLocal, '.'), { recursive: true });
     writeFileSync(join(freshLocal, 'LOCAL-SCAFFOLD'), 'scaffold\n');
     git(freshLocal, 'add', '-A');
     git(freshLocal, 'commit', '-q', '-m', 'local: scaffold');
@@ -445,20 +446,24 @@ describe('mirror pull with root commits on the mirror', () => {
     git(freshLocal, 'remote', 'add', 'upstream', upstream);
     git(freshLocal, 'fetch', '-q', 'upstream');
 
-    // Configure as a mirror of the upstream.
+    // Configure as a mirror of upstream. NO `mirror bootstrap` call.
     git(freshLocal, 'config', 'auto-remote.upstream.syncPaths', 'packages');
     git(freshLocal, 'config', 'auto-remote.upstream.syncTargetBranch', 'private');
     git(freshLocal, 'config', 'auto-remote.upstream.syncBranch', 'main');
     git(freshLocal, 'config', 'auto-remote.upstream.pushSyncRef', 'false');
 
-    // Bootstrap tracking at upstream's ACTUAL root commit.
-    const upstreamRoot = git(join(root, 'seed'), 'rev-list', '--max-parents=0', 'HEAD');
-    git(freshLocal, 'update-ref', TRACKING_UPSTREAM, upstreamRoot);
-
-    // Pre-state assertion: local HEAD does NOT have packages/cli/a.ts.
+    // Pre-state assertions.
     expect(existsSync(join(freshLocal, 'packages/cli/a.ts'))).toBe(false);
+    // No tracking ref set. Check via spawn since `git rev-parse --verify`
+    // exits non-zero when the ref doesn't exist (throws in our `git()` helper).
+    const preTrackingStatus = spawnSync(
+      'git',
+      ['-C', freshLocal, 'rev-parse', '--verify', '--quiet', TRACKING_UPSTREAM],
+      { stdio: 'pipe' },
+    ).status;
+    expect(preTrackingStatus).not.toBe(0);
 
-    // Run mirror pull from this fresh local.
+    // Run mirror pull.
     const savedCwd = process.cwd();
     process.chdir(freshLocal);
     try {
@@ -468,13 +473,14 @@ describe('mirror pull with root commits on the mirror', () => {
       process.chdir(savedCwd);
     }
 
-    // Post-state: root commit's content landed. This is the whole point of
-    // the v0.5.3 root-inclusive fix.
+    // Post-state: root commit's content landed, plus children.
     expect(existsSync(join(freshLocal, 'packages/cli/a.ts'))).toBe(true);
     expect(readFileSync(join(freshLocal, 'packages/cli/a.ts'), 'utf8')).toBe('pkg A v1\n');
-    // And the subsequent commits on upstream (pkg: add B, docs: add readme)
-    // are also handled: b.ts landed, README.md is out-of-scope (no sync match).
     expect(readFileSync(join(freshLocal, 'packages/cli/b.ts'), 'utf8')).toBe('pkg B v1\n');
+    // README.md was out-of-scope (no sync match) and dropped.
     expect(existsSync(join(freshLocal, 'README.md'))).toBe(false);
+    // Tracking ref advanced to latest applied.
+    const trackingAfter = git(freshLocal, 'rev-parse', TRACKING_UPSTREAM);
+    expect(trackingAfter.length).toBe(40);
   });
 });

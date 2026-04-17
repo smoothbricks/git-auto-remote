@@ -20,7 +20,6 @@ import {
   hasStagedChanges,
   hasUnresolvedMergeConflicts,
   isAncestorOf,
-  isRootCommit,
   listCommitsInRange,
   readCommitMeta,
   readCurrentPatchSha,
@@ -121,11 +120,6 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   }
 
   const last = readTrackingRef(mirror.remote);
-  if (!last) {
-    console.error(`[mirror ${mirror.remote}] Not bootstrapped. Run:`);
-    console.error(`  git-auto-remote mirror bootstrap ${mirror.remote} <sha>`);
-    return 1;
-  }
   const head = revParse(`refs/remotes/${mirror.remote}/${mirror.syncBranch}`);
   if (!head) {
     console.error(`[mirror ${mirror.remote}] Cannot resolve refs/remotes/${mirror.remote}/${mirror.syncBranch}.`);
@@ -135,7 +129,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     // Up to date; nothing to say.
     return 0;
   }
-  if (!isAncestorOf(last, head)) {
+  if (last && !isAncestorOf(last, head)) {
     // Distinguish "force-push" from "intentional cross-history bootstrap":
     //   - If the two commits share any merge-base, they were once on the same
     //     history line and `last` has fallen off -> force-push, refuse.
@@ -164,15 +158,12 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     regeneratePaths: mirror.regeneratePaths,
   };
   const shas = listCommitsInRange(last, head);
-  // When the bootstrap target IS a root commit, `listCommitsInRange` (which
-  // uses `<last>..<to>` semantics, excluding `<last>`) would skip the root's
-  // own content - meaning any file private creates in its root commit never
-  // lands in public's HEAD, and subsequent commits referring to that content
-  // hit modify/delete conflicts. Prepend the root to the replay stream so it
-  // gets applied first. For non-root bootstraps the caller asserts the
-  // content is already locally present so exclusion is correct.
-  if (isRootCommit(last)) {
-    shas.unshift(last);
+  if (!last && shas.length > 0) {
+    // No tracking ref = full-history replay. Let the user know what they're
+    // in for (as opposed to "up to date" ambiguity if this is silent).
+    console.error(
+      `[mirror ${mirror.remote}] No tracking ref set; starting full-history replay from the mirror's root (${shas.length} commits).`,
+    );
   }
   const classified: ClassifiedCommit[] = shas.map((sha) => ({
     sha,

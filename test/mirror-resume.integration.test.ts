@@ -504,3 +504,168 @@ describe('sub-case C: pure-review-only commit', () => {
     expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(false);
   });
 });
+
+/**
+ * v0.5.4 critical regression: when the root commit of the mirror is itself a
+ * partial (has review paths or outside-scope paths), resuming past it via
+ * `mirror continue` must advance cleanly to subsequent commits. Pre-0.5.4
+ * had a "prepend root on every pull iteration" hack that re-pre-pended the
+ * root on every resume, causing an infinite loop.
+ *
+ * The scenario reproduces the real-world bug the user hit on Conloca:
+ *   - Fresh local (no tracking ref)
+ *   - Upstream's root commit touches a reviewPath AND an out-of-scope path
+ *     AND syncPath content -> classified as partial
+ *   - First `mirror pull` pauses on the root (sub-case B)
+ *   - User stages + `mirror continue` -> amends HEAD
+ *   - Second iteration (triggered by continue's tail-call to mirrorPull)
+ *     must NOT re-try the root; must proceed to root's children instead.
+ */
+describe('v0.5.4: root-commit partial + resume does not loop', () => {
+  let freshLocal: string;
+  let rootSha: string;
+  let secondSha: string;
+
+  beforeEach(() => {
+    // Upstream: add ANOTHER pre-existing commit series for a cleaner test.
+    // pushing a brand new upstream with a root that's itself a partial:
+    //   commit 1 (root):   packages/cli/a.ts + reviewPath + out-of-scope file
+    //   commit 2:          simple child modifying packages/cli/a.ts
+    const seed = join(root, 'seed');
+    // beforeEach(main) already created a seed with root + post-root marker.
+    // Add a commit that modifies a.ts (clean child of root).
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'pkg: bump A');
+    git(seed, 'push', '-q', 'origin', 'main');
+
+    // Now make the root into a partial post-hoc: commit an additional commit
+    // that touches a reviewPath AND an out-of-scope path. Root is already
+    // the first commit; to keep things simple, we just treat the root itself
+    // as sufficient (it touches only packages/cli/a.ts in current beforeEach,
+    // which is clean). We want a ROOT that is a partial though.
+    //
+    // Simpler: make a BRAND NEW fresh-local scenario with a brand-new seed
+    // whose root IS a partial. Avoids mucking with shared beforeEach setup.
+    freshLocal = join(root, 'fresh-local-for-root-partial');
+    const freshSeed = join(root, 'fresh-seed-for-root-partial');
+    const freshUpstream = join(root, 'fresh-upstream-for-root-partial.git');
+    git(root, 'init', '--bare', '-q', freshUpstream);
+    git(root, 'init', '-q', freshSeed);
+    // Root commit: has packages (in sync), reviewPath nx.json, and an
+    // out-of-scope PRIVATE.md - makes it a partial.
+    mkdirSync(join(freshSeed, 'packages/cli'), { recursive: true });
+    writeFileSync(join(freshSeed, 'packages/cli/a.ts'), 'root v1\n');
+    writeFileSync(join(freshSeed, 'nx.json'), '{"root": true}\n');
+    writeFileSync(join(freshSeed, 'PRIVATE.md'), 'private scratch\n');
+    git(freshSeed, 'add', '-A');
+    git(freshSeed, 'commit', '-q', '-m', 'root: initial commit (partial)');
+    rootSha = git(freshSeed, 'rev-parse', 'HEAD');
+    // Child commit: clean, only touches packages/
+    writeFileSync(join(freshSeed, 'packages/cli/a.ts'), 'root v1\n+ child line\n');
+    git(freshSeed, 'add', '-A');
+    git(freshSeed, 'commit', '-q', '-m', 'pkg: bump A');
+    secondSha = git(freshSeed, 'rev-parse', 'HEAD');
+    git(freshSeed, 'branch', '-M', 'main');
+    git(freshSeed, 'remote', 'add', 'origin', freshUpstream);
+    git(freshSeed, 'push', '-q', 'origin', 'main');
+
+    git(root, 'init', '-q', freshLocal);
+    writeFileSync(join(freshLocal, 'LOCAL_SCAFFOLD'), 'scaffold\n');
+    git(freshLocal, 'add', '-A');
+    git(freshLocal, 'commit', '-q', '-m', 'local: scaffold');
+    git(freshLocal, 'branch', '-M', 'private');
+    git(freshLocal, 'remote', 'add', 'upstream', freshUpstream);
+    git(freshLocal, 'fetch', '-q', 'upstream');
+    git(freshLocal, 'config', 'auto-remote.upstream.syncPaths', 'packages');
+    git(freshLocal, 'config', 'auto-remote.upstream.reviewPaths', 'nx.json');
+    git(freshLocal, 'config', 'auto-remote.upstream.syncTargetBranch', 'private');
+    git(freshLocal, 'config', 'auto-remote.upstream.syncBranch', 'main');
+    git(freshLocal, 'config', 'auto-remote.upstream.pushSyncRef', 'false');
+
+    process.chdir(freshLocal);
+    installHook('post-applypatch');
+  });
+
+  test('full flow: root-partial pauses, continue advances to child without looping on root', async () => {
+    // First pull: enumerates [root, child]. Root is partial (has review
+    // content + out-of-scope content), so replay pauses after landing the
+    // included subset of the root.
+    const code1 = await mirrorPull({ remote: 'upstream' });
+    expect(code1).toBe(0);
+
+    // HEAD should be the included-only subset of root (packages/cli/a.ts).
+    expect(existsSync(join(freshLocal, 'packages/cli/a.ts'))).toBe(true);
+    expect(readFileSync(join(freshLocal, 'packages/cli/a.ts'), 'utf8')).toBe('root v1\n');
+    // nx.json was review -> in worktree as unstaged.
+    expect(readFileSync(join(freshLocal, 'nx.json'), 'utf8')).toContain('"root": true');
+    // PRIVATE.md was outside-scope -> NOT on HEAD, NOT in worktree.
+    expect(existsSync(join(freshLocal, 'PRIVATE.md'))).toBe(false);
+    // Pending review marker written.
+    const marker = JSON.parse(readFileSync(join(freshLocal, '.git/git-auto-remote/review-pending'), 'utf8'));
+    expect(marker.phase).toBe('review-pause');
+    expect(marker.sourceSha).toBe(rootSha);
+
+    // Tracking ref advanced to root SHA.
+    expect(git(freshLocal, 'rev-parse', trackingRefName('upstream'))).toBe(rootSha);
+
+    // User stages the review path + continues. continueReviewPause should
+    // amend HEAD and tail-call mirrorPull. The BUG we're guarding against:
+    // pre-0.5.4, mirrorPull would re-see tracking-at-root and try to replay
+    // the root AGAIN (infinite loop).
+    git(freshLocal, 'add', 'nx.json');
+    const code2 = await mirrorContinue('upstream');
+    expect(code2).toBe(0);
+
+    // HEAD's previous commit (root-subset) has been amended to include
+    // nx.json; then the child commit landed on top.
+    const headSubjects = git(freshLocal, 'log', '--format=%s', '-n', '3').split('\n');
+    expect(headSubjects).toEqual(['pkg: bump A', 'root: initial commit (partial)', 'local: scaffold']);
+
+    // Tracking ref is now at the child commit (the latest applied).
+    expect(git(freshLocal, 'rev-parse', trackingRefName('upstream'))).toBe(secondSha);
+
+    // Child commit's content landed.
+    expect(readFileSync(join(freshLocal, 'packages/cli/a.ts'), 'utf8')).toBe('root v1\n+ child line\n');
+
+    // Review-pending marker cleared.
+    expect(existsSync(join(freshLocal, '.git/git-auto-remote/review-pending'))).toBe(false);
+  });
+
+  test('skip flow: root-partial skipped -> tracking stays at root, next pull proceeds to child', async () => {
+    // First pull pauses on root.
+    await mirrorPull({ remote: 'upstream' });
+    expect(git(freshLocal, 'rev-parse', trackingRefName('upstream'))).toBe(rootSha);
+
+    // User skips root. Sub-case B skip: reset HEAD~1, discard worktree
+    // overlay. Tracking stays at rootSha (already advanced). Skip auto-
+    // resumes mirrorPull which should try to process the child. Since
+    // the child's diff depends on root's content (which we skipped), it
+    // will likely 3-way conflict on packages/cli/a.ts - but that's a REAL
+    // conflict from a downstream commit, not the infinite-loop bug we're
+    // guarding against. The key invariant: tracking advanced past root,
+    // and the stuck commit (if any) is the CHILD, not the root again.
+    const code = await mirrorSkip('upstream');
+    // Exit 0 if child applied cleanly, 1 if hit a downstream conflict.
+    // Either outcome demonstrates we moved past root without looping.
+    expect([0, 1]).toContain(code);
+
+    // The infinite-loop bug (pre-0.5.4) had the tool re-prepend root to
+    // the replay on every iteration, so the stuck patch in .git/rebase-apply
+    // would always be root's patch. Here we verify we moved on: if am is in
+    // progress, the stuck commit is the CHILD (not root being retried).
+    // Tracking ref itself stays at rootSha on am-conflict (post-applypatch
+    // only advances on successful apply) - so we don't check tracking,
+    // we check which commit the pipeline is currently processing.
+    if (existsSync(join(freshLocal, '.git/rebase-apply/next'))) {
+      const stuckPatchFile = join(freshLocal, '.git/rebase-apply/0001');
+      const firstLine = readFileSync(stuckPatchFile, 'utf8').split('\n', 1)[0];
+      const stuckSha = firstLine.match(/^From\s+([0-9a-f]{40})\s+/)?.[1];
+      expect(stuckSha).toBe(secondSha);
+      expect(stuckSha).not.toBe(rootSha);
+    } else {
+      // Clean apply - tracking should be at secondSha
+      expect(git(freshLocal, 'rev-parse', trackingRefName('upstream'))).toBe(secondSha);
+    }
+  });
+});
