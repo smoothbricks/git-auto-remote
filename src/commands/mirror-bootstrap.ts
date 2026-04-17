@@ -35,7 +35,7 @@ export function mirrorBootstrap(remote: string, shaArg: string, force: boolean):
 
   const existing = readTrackingRef(remote);
   if (existing && !force) {
-    console.error(`[git-auto-remote] Mirror '${remote}' already bootstrapped at ${existing.slice(0, 12)}.`);
+    console.error(`[git-auto-remote] Mirror '${remote}' already bootstrapped at ${existing.slice(0, 8)}.`);
     console.error(`  Re-bootstrap with:  git-auto-remote mirror bootstrap ${remote} <sha> --force`);
     console.error(`  Or remove the tracking ref to fall back to full-history replay on next pull:`);
     console.error(`    git update-ref -d refs/git-auto-remote/mirror/${remote}/last-synced`);
@@ -49,7 +49,7 @@ export function mirrorBootstrap(remote: string, shaArg: string, force: boolean):
   }
 
   if (isRootCommit(sha)) {
-    console.error(`[git-auto-remote] Warning: ${sha.slice(0, 12)} is a ROOT commit.`);
+    console.error(`[git-auto-remote] Warning: ${sha.slice(0, 8)} is a ROOT commit.`);
     console.error(`  Bootstrapping here means its content is SKIPPED from the next 'mirror pull'`);
     console.error(`  (bootstrap semantics: "this SHA's content is already locally reflected").`);
     console.error(`  If you want the root INCLUDED in the replay (fresh clone, no prior content),`);
@@ -61,6 +61,6 @@ export function mirrorBootstrap(remote: string, shaArg: string, force: boolean):
   }
 
   updateTrackingRef(remote, sha);
-  console.error(`[git-auto-remote] Mirror '${remote}' bootstrapped at ${sha.slice(0, 12)}.`);
+  console.error(`[git-auto-remote] Mirror '${remote}' bootstrapped at ${sha.slice(0, 8)}.`);
   return 0;
 }

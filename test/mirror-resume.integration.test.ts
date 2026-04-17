@@ -669,3 +669,109 @@ describe('v0.5.4: root-commit partial + resume does not loop', () => {
     }
   });
 });
+
+/**
+ * v0.5.5 regression: the partial-pause footer tells the user to run
+ * `git diff HEAD <sourceSha>` to see what's in the source commit that
+ * didn't land in HEAD. That hint is only useful if the diff ACTUALLY
+ * produces output - tested explicitly below. Three cases:
+ *
+ *   1. Review-path overlay: HEAD has included subset, source has
+ *      reviewPath content that did NOT land in HEAD.
+ *      `git diff HEAD <source>` -> shows reviewPath content change.
+ *
+ *   2. Outside-scope content: source has a path that doesn't match any
+ *      bucket, so it was dropped. HEAD lacks it entirely.
+ *      `git diff HEAD <source>` -> shows the dropped path as an addition.
+ *
+ *   3. Mixed: review + outside + included. All three categories of
+ *      "what's in source but not HEAD" surfaced in one diff.
+ */
+describe('v0.5.5: review-pause footer Dropped-hint produces meaningful diff', () => {
+  function pushPartialWithReviewAndOutside(): string {
+    // Seed reviewed on both sides at v1.
+    writeFileSync(join(local, 'packages/reviewed'), 'reviewed v1\n');
+    git(local, 'add', '-A');
+    git(local, 'commit', '-q', '-m', 'local: seed reviewed');
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v1\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'upstream: seed reviewed');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+
+    // Partial: bumps a.ts (included) + reviewed (review) + root-README.md (outside).
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream\n');
+    writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v2 upstream\n');
+    writeFileSync(join(seed, 'README.md'), '# Public Readme\nDescription.\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'feat: bump A + review + outside');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    return git(seed, 'rev-parse', 'HEAD');
+  }
+
+  beforeEach(() => {
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/reviewed');
+  });
+
+  test("'git diff HEAD <sourceSha>' after a mixed partial pause shows review + outside content", async () => {
+    const sourceSha = pushPartialWithReviewAndOutside();
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0);
+
+    // Sanity: HEAD moved (applyPartial landed the included subset).
+    const headSha = git(local, 'rev-parse', 'HEAD');
+    expect(headSha).not.toBe(sourceSha);
+
+    // The footer's suggested diff must produce real output AND reference
+    // the specific dropped/review paths a user needs to see.
+    const diffOut = git(local, 'diff', 'HEAD', sourceSha);
+    expect(diffOut.length).toBeGreaterThan(0);
+
+    // Review-path content should be in the diff: HEAD has v1, source has v2.
+    expect(diffOut).toContain('packages/reviewed');
+    expect(diffOut).toContain('reviewed v2 upstream');
+
+    // Outside-path content: HEAD doesn't have README.md, source does.
+    expect(diffOut).toContain('README.md');
+    expect(diffOut).toContain('Public Readme');
+
+    // Included paths should NOT appear as deltas (they already landed in HEAD).
+    // packages/cli/a.ts should appear in the diff only if there's something
+    // different between HEAD's applied version and source's - and by design
+    // there shouldn't be for the included subset. Assert it's absent from
+    // the diff BY HEADER (not a substring match, since 'a.ts' could show up
+    // inside one of the other diffs).
+    expect(diffOut).not.toMatch(/^\+\+\+ b\/packages\/cli\/a\.ts$/m);
+
+    // Marker records the correct source sha (what the footer shows).
+    const marker = JSON.parse(readFileSync(join(local, '.git/git-auto-remote/review-pending'), 'utf8'));
+    expect(marker.sourceSha).toBe(sourceSha);
+  });
+
+  test("'git diff HEAD <sourceSha>' output is non-empty even for outside-only partials (no review)", async () => {
+    // No review path config this time - the partial is purely included + outside.
+    git(local, 'config', '--unset-all', 'auto-remote.upstream.reviewPaths');
+
+    // Seed minimal: just an upstream commit that adds packages/ + outside.
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/cli/b.ts'), 'new b\n');
+    writeFileSync(join(seed, 'README.md'), 'outside content\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'feat: mixed + outside');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    const sourceSha = git(seed, 'rev-parse', 'HEAD');
+
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0);
+
+    const diffOut = git(local, 'diff', 'HEAD', sourceSha);
+    expect(diffOut.length).toBeGreaterThan(0);
+    // README.md (outside) must appear - that's the only thing the user needs to see.
+    expect(diffOut).toContain('README.md');
+    expect(diffOut).toContain('outside content');
+  });
+});

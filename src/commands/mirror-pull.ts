@@ -435,7 +435,7 @@ async function handlePartial(
     outside,
     phase: 'review-pause',
   });
-  printPartialFooter(mirror.remote, review.length > 0);
+  printPartialFooter(mirror.remote, review.length > 0, commit.sha, subject);
   return { kind: 'paused' };
 }
 
@@ -543,7 +543,7 @@ function handlePureReview(
     outside,
     phase: 'pure-review-pause',
   });
-  printPartialFooter(mirror.remote, review.length > 0);
+  printPartialFooter(mirror.remote, review.length > 0, sha, subject);
   return { kind: 'paused' };
 }
 
@@ -601,12 +601,12 @@ function finalizePureReviewAsResolved(
  * there are no conflict markers is confusing and wastes time.
  */
 function printAmStopMessage(remote: string): void {
-  // Identify which commit is currently stuck so the user doesn't have to
-  // grep .git/rebase-apply/ themselves. Format: `abc12345 subject line`.
-  // Missing SHA/subject degrade gracefully to the prior generic wording.
+  // Identify which commit is currently stuck using the consistent
+  // `<sha8>  <subject>` format used elsewhere. Missing SHA/subject degrade
+  // gracefully to generic wording.
   const stuckSha = readCurrentPatchSha();
   const stuckLabel = stuckSha
-    ? `${stuckSha.slice(0, 8)} ${commitSubject(stuckSha) || '(unknown subject)'}`
+    ? `${stuckSha.slice(0, 8)}  ${commitSubject(stuckSha) || '(unknown subject)'}`
     : 'current patch';
 
   if (hasUnresolvedMergeConflicts()) {
@@ -616,7 +616,7 @@ function printAmStopMessage(remote: string): void {
     console.error(`    git-auto-remote mirror skip     ${remote}   # drop this commit`);
     return;
   }
-  console.error(`[mirror ${remote}] 'git am' stopped structurally on ${stuckLabel}`);
+  console.error(`[mirror ${remote}] Stopped structurally on ${stuckLabel}`);
   console.error(`[mirror ${remote}]   The patch references content missing from HEAD (e.g. a rename from a path`);
   console.error(`[mirror ${remote}]   not present, or a mode change on a file that wasn't synced). Working tree`);
   console.error(`[mirror ${remote}]   is clean; there are no conflict markers to resolve.`);
@@ -656,6 +656,12 @@ function printOverlayNote(remote: string, mode: 'applied' | 'conflict' | 'fallba
   // 'applied': nothing extra; default pause message is clear enough.
 }
 
+/**
+ * Pause-message header. Format deliberately matches the Applying/Skipping
+ * announcements in `printApplyingLines`: `[mirror X] Label: <sha8>  <subject>`.
+ * Short SHA always leads, two-space gutter, no parens. See printPartialFooter
+ * for the corresponding resume-commands footer.
+ */
 function printPartialHeader(
   remote: string,
   subject: string,
@@ -664,7 +670,7 @@ function printPartialHeader(
   regenerate: readonly string[],
   outside: readonly string[],
 ): void {
-  console.error(`[mirror ${remote}] Partial: ${subject} (${sha.slice(0, 8)})`);
+  console.error(`[mirror ${remote}] Partial:  ${sha.slice(0, 8)}  ${subject}`);
   if (review.length > 0) {
     console.error(`  Review (in worktree, unstaged): ${review.join(', ')}`);
   }
@@ -676,17 +682,33 @@ function printPartialHeader(
   }
 }
 
-function printPartialFooter(remote: string, hasReview: boolean): void {
+/**
+ * Pause-message footer: a source-commit recap (repeats the sha+subject from
+ * the header so it stays in view even after the regenerate output has
+ * scrolled the header offscreen), then the review/stage/discard hints when
+ * applicable, then the `mirror diff`/`mirror source`/`mirror continue`/
+ * `mirror skip` command surface.
+ *
+ * `mirror diff` shows the source-vs-HEAD diff filtered to the sync domain
+ * (syncPaths ∪ reviewPaths ∪ regeneratePaths ∪ source's outside set, minus
+ * excludePaths) - i.e. only the paths the tool considered relevant to the
+ * sync, excluding purely-private paths the user doesn't want to review.
+ */
+function printPartialFooter(remote: string, hasReview: boolean, sourceSha: string, sourceSubject: string): void {
+  const short = sourceSha.slice(0, 8);
+  console.error(``);
+  console.error(`  Source:   ${short}  ${sourceSubject}`);
   console.error(``);
   if (hasReview) {
-    console.error(`  Review:    git diff                       # see unstaged review content`);
-    console.error(`  Stage:     git add -p                     # pick hunks into the commit`);
-    console.error(`  Discard:   git restore <paths>            # drop review hunks`);
-  } else {
-    console.error(`  Review:    git show HEAD`);
+    console.error(`  Review:   git diff                              # see unstaged review content`);
+    console.error(`  Stage:    git add -p                            # pick hunks into the commit`);
+    console.error(`  Discard:  git restore <paths>                   # drop review hunks`);
   }
-  console.error(`  Continue:  git-auto-remote mirror continue ${remote}`);
-  console.error(`  Skip:      git-auto-remote mirror skip ${remote}`);
+  console.error(`  Dropped:  git-auto-remote mirror diff ${remote}       # source-vs-HEAD, sync-domain scoped`);
+  console.error(`  Show:     git-auto-remote mirror source ${remote}     # full 'git show' of the source commit`);
+  console.error(``);
+  console.error(`  Continue: git-auto-remote mirror continue ${remote}`);
+  console.error(`  Skip:     git-auto-remote mirror skip ${remote}`);
 }
 
 /**

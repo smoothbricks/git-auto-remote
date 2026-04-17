@@ -3,9 +3,11 @@ import { parseArgs } from 'node:util';
 import { detect } from './commands/detect.js';
 import { mirrorBootstrap } from './commands/mirror-bootstrap.js';
 import { mirrorContinue } from './commands/mirror-continue.js';
+import { mirrorDiff } from './commands/mirror-diff.js';
 import { mirrorList } from './commands/mirror-list.js';
 import { mirrorPull } from './commands/mirror-pull.js';
 import { mirrorSkip } from './commands/mirror-skip.js';
+import { mirrorSource } from './commands/mirror-source.js';
 import { mirrorStatus } from './commands/mirror-status.js';
 import { postApplypatch } from './commands/post-applypatch.js';
 import { postCheckout } from './commands/post-checkout.js';
@@ -26,11 +28,14 @@ Core commands:
 Mirror commands (cherry-pick from a remote with disjoint history):
   mirror list                                   List configured mirrors
   mirror status [<remote>]                      Show sync state for mirror(s)
-  mirror bootstrap <remote> <sha> [--force]     Initialize tracking ref
+  mirror bootstrap <remote> <sha> [--force]     Initialize tracking ref (optional)
   mirror pull [<remote>] [--non-interactive]    Sync new mirror commits
                            [--on-partial <cmd>] Handler for partial commits
   mirror continue [<remote>]                    Resume from any sync pause
   mirror skip [<remote>]                        Skip the paused commit, resume
+  mirror diff [<remote>] [--include-excluded]   Source-vs-HEAD diff during pause,
+              [--raw] [git-diff-args...]        scoped to the sync domain
+  mirror source [<remote>] [git-show-args...]   'git show' the current pause's source
 
 Hook entry points (invoked by installed hooks; not meant for manual use):
   post-checkout <prev> <new> <flag>
@@ -87,6 +92,18 @@ async function main(): Promise<number> {
         return await mirrorContinue(subArgs[0]);
       case 'skip':
         return await mirrorSkip(subArgs[0]);
+      case 'diff': {
+        // First subArg may be a remote name OR a flag/passthrough arg. If it
+        // starts with '-' treat all subArgs as flags/passthrough.
+        const first = subArgs[0];
+        const hasRemote = first && !first.startsWith('-');
+        return mirrorDiff(hasRemote ? first : undefined, hasRemote ? subArgs.slice(1) : subArgs);
+      }
+      case 'source': {
+        const first = subArgs[0];
+        const hasRemote = first && !first.startsWith('-');
+        return mirrorSource(hasRemote ? first : undefined, hasRemote ? subArgs.slice(1) : subArgs);
+      }
       case 'am-continue':
       case 'am-skip':
         console.error(
