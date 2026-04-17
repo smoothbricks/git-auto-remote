@@ -27,24 +27,20 @@ function exitBehavior(name: HookName): string {
  * Shell snippet injected into hook files. The string `git-auto-remote <hook>` is the
  * marker used to detect our presence in existing hooks (for chainability and idempotence).
  *
- * The `@<major>.<minor>.x` pin on the bunx call ensures the hook invokes the same
- * release line the installer was run from, rather than whatever bunx has cached.
- * Upgrading across a minor bump is done by re-running `git-auto-remote setup` with
- * the new version - the installer detects and replaces an outdated block in place.
+ * The bunx call pins to the EXACT version of git-auto-remote that was used to run
+ * `setup`. Wildcard specifiers like `@0.3.x` were tempting (would let patch releases
+ * roll out automatically) but bunx has inconsistent resolution of `x`-style wildcards:
+ * the command "appears to run" but silently no-ops. Explicit versions always work,
+ * and re-running `setup` after a tool upgrade is a single command - the installer
+ * detects and replaces the outdated block in place.
  */
 function hookSnippet(name: HookName): string {
   return [
     `# >>> git-auto-remote ${name} ${VERSION} >>>`,
     `# Managed by git-auto-remote. Safe to chain with other hooks above/below these markers.`,
-    `bunx --bun git-auto-remote@${pinForVersion(VERSION)} ${name} "$@" ${exitBehavior(name)}`,
+    `bunx --bun git-auto-remote@${VERSION} ${name} "$@" ${exitBehavior(name)}`,
     `# <<< git-auto-remote ${name} <<<`,
   ].join('\n');
-}
-
-/** Convert "0.3.1" -> "0.3.x" so patch-level bugfixes roll out without re-running setup. */
-function pinForVersion(v: string): string {
-  const [major, minor] = v.split('.');
-  return `${major}.${minor}.x`;
 }
 
 const SHEBANG = '#!/usr/bin/env bash';
