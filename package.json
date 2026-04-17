@@ -1,0 +1,32 @@
+{
+  "name": "git-auto-remote",
+  "version": "0.1.0",
+  "description": "Automatically route git push/pull to the right remote based on branch ancestry. Useful for public/private fork workflows and multi-upstream repos.",
+  "keywords": ["git", "hooks", "remote", "fork", "monorepo", "post-checkout", "pre-push", "ancestry"],
+  "license": "MIT",
+  "author": "Danny Wilson",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/git-auto-remote.git"
+  },
+  "homepage": "https://github.com/smoothbricks/git-auto-remote#readme",
+  "bugs": "https://github.com/smoothbricks/git-auto-remote/issues",
+  "bin": { "git-auto-remote": "./dist/cli.js" },
+  "main": "./dist/cli.js",
+  "type": "module",
+  "files": ["dist", "!**/*.tsbuildinfo"],
+  "scripts": {
+    "build": "tsc && chmod +x dist/cli.js",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "bun test",
+    "check": "bun run typecheck && bun run test",
+    "prepublishOnly": "bun run check && bun run build"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.9",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": { "node": ">=18" },
+  "publishConfig": { "access": "public" }
+}
