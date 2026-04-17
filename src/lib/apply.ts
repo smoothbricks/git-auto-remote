@@ -1,5 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { amInProgress, commitSubject, gitTry } from './git.js';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { amInProgress, commitSubject, gitTry, hasUnresolvedMergeConflicts } from './git.js';
 import type { ClassifiedCommit } from './classify.js';
 
 /**
@@ -137,23 +139,35 @@ export function applyPartial(
  * into HEAD, before pausing for human review. User can then `git add -p` /
  * `git restore` / `git commit --amend --no-edit` interactively.
  *
- * Conflict resolution follows `git apply --3way` semantics: if a review-path
- * hunk cannot be applied cleanly, conflict markers are left in the file and
- * the user resolves them before `mirror continue`.
+ * Three-state return distinguishes behaviour for the pause message:
+ *
+ *   'applied'     - diff applied cleanly, worktree now has unstaged delta the
+ *                   user can `git add -p` through. Also the "nothing to do"
+ *                   case (empty diff).
+ *
+ *   'conflict'    - `git apply --3way` left conflict markers in some files.
+ *                   User resolves (edits + git add) before `mirror continue`.
+ *
+ *   'fallback'    - `git apply --3way` REFUSED the diff entirely (base content
+ *                   missing, no common ancestor blob available locally, etc.)
+ *                   and wrote NOTHING. Rather than pausing with an empty
+ *                   worktree (user has nothing to review), we fall back to
+ *                   writing each review path's CURRENT-VERSION-AT-SOURCE blob
+ *                   directly into the worktree - the user sees `git diff`
+ *                   showing the full delta between local content and source's
+ *                   version, and can `git add -p` the hunks they want.
+ *                   Source-deletions reflect as file removals.
+ *
+ *   'error'       - something unexpected (git missing, IO failure, etc.).
  *
  * The empty-tree fallback for root commits uses the well-known empty-tree SHA
  * (`4b825dc642cb6eb9a060e54bf8d69288fbee4904`).
- *
- * @returns
- *   'applied'  - diff applied cleanly, or was empty (nothing to do)
- *   'conflict' - some hunks left conflict markers in worktree files
- *   'error'    - git reported a failure we couldn't classify as conflict
  */
 export function applyReviewToWorktree(
   sha: string,
   reviewPaths: readonly string[],
   excludePaths: readonly string[] = [],
-): 'applied' | 'conflict' | 'error' {
+): 'applied' | 'conflict' | 'fallback' | 'error' {
   if (reviewPaths.length === 0) return 'applied';
 
   const pathspec = [...reviewPaths, ...excludePaths.map((p) => `:(exclude)${p}`)];
@@ -166,28 +180,36 @@ export function applyReviewToWorktree(
 
   let diffBuf: Buffer;
   try {
-    diffBuf = execFileSync('git', diffArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+    diffBuf = execFileSync('git', diffArgs, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
   } catch {
     return 'error';
   }
 
   if (diffBuf.length === 0) return 'applied'; // nothing in scope
 
-  // `git apply --3way` writes to the worktree AND the index (--3way implies
-  // --index). We want review content UNSTAGED so `mirror continue` only
-  // amends when the user explicitly `git add`s - so we unstage everything
-  // `--3way` just touched. Use execFileSync with the list of pathspecs to
-  // be precise.
+  // Primary path: `git apply --3way`. --3way implies --index (touches both
+  // working tree AND index).
   const apply = spawnSync('git', ['apply', '--3way'], {
     input: diffBuf,
     stdio: ['pipe', 'inherit', 'inherit'],
   });
   const applyStatus = apply.status;
 
-  // Unstage any paths --3way may have staged. Use `git reset HEAD -- <paths>`
-  // (rather than the reviewPaths pathspecs, which could be directories) by
-  // discovering what's actually staged and resetting those entries. Safe even
-  // if there's nothing staged.
+  // IMPORTANT: check conflict state BEFORE any index cleanup. `git reset
+  // HEAD -- <path>` on an unmerged (stage 1/2/3) entry clears the U state
+  // and reinitialises as stage 0 matching HEAD - which would hide a real
+  // conflict from `hasUnresolvedMergeConflicts()`.
+  if (applyStatus !== 0 && hasUnresolvedMergeConflicts()) {
+    // --3way left conflict markers; leave the UU index entries alone so the
+    // user's normal resolve-then-git-add workflow works as expected.
+    return 'conflict';
+  }
+
+  // No unresolved merge state from here on. Safe to unstage. We want review
+  // content UNSTAGED so `mirror continue` only amends when the user
+  // explicitly `git add`s, so we unstage anything --3way staged.
   const stagedOut = gitTry('diff', '--cached', '--name-only');
   if (stagedOut) {
     const stagedPaths = stagedOut.split('\n').filter((p) => p.length > 0);
@@ -197,7 +219,69 @@ export function applyReviewToWorktree(
   }
 
   if (applyStatus === 0) return 'applied';
-  return 'conflict';
+
+  // Non-zero exit AND no unresolved markers: apply refused entirely (no
+  // common ancestor blob or total mismatch; worktree unchanged). Fall back
+  // to writing each review path's source-version blob directly to the
+  // worktree so the user sees a `git diff` they can act on. Sacrifices the
+  // "minimal delta" property of --3way (user sees FULL delta, not just the
+  // commit's change), but strictly more information and preserves
+  // interactivity - the alternative pauses with an empty worktree, leaving
+  // the user nothing to review.
+  const fallbackOk = writeSourceVerbatim(sha, reviewPaths);
+  return fallbackOk ? 'fallback' : 'error';
+}
+
+/**
+ * For each of `paths`, overwrite the working-tree entry with the source
+ * commit's version (or delete it if the source doesn't contain that path).
+ * Does NOT touch the index - all changes show up as unstaged.
+ *
+ * Used as the fallback for `applyReviewToWorktree` when `git apply --3way`
+ * refuses a diff entirely (no common ancestor, base mismatch).
+ *
+ * Returns false if any path's write fails; true otherwise.
+ */
+function writeSourceVerbatim(sha: string, paths: readonly string[]): boolean {
+  for (const path of paths) {
+    const existsAtSource = (() => {
+      try {
+        execFileSync('git', ['cat-file', '-e', `${sha}:${path}`], {
+          stdio: 'ignore',
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+
+    if (existsAtSource) {
+      let content: Buffer;
+      try {
+        content = execFileSync('git', ['show', `${sha}:${path}`], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch {
+        return false;
+      }
+      try {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, content);
+      } catch {
+        return false;
+      }
+    } else {
+      // Source doesn't contain this path - treat as deletion. Remove from
+      // worktree if it exists locally. Missing-file errors are fine (the
+      // file already not being there matches the source's "no such path").
+      try {
+        rmSync(path, { force: true });
+      } catch {
+        // swallow: best-effort, not fatal
+      }
+    }
+  }
+  return true;
 }
 
 /** Pretty-print "Applying: <subject>" lines, mimicking `git am`'s own output. */

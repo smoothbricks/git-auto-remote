@@ -370,6 +370,7 @@ async function handlePartial(
         return { kind: 'error' };
       }
       // 'conflict' leaves conflict markers; handler is free to resolve.
+      // 'fallback' wrote source-verbatim; handler sees full delta, its own concern.
     }
     console.error(`[mirror ${mirror.remote}]   invoking handler: ${handler}`);
     const outcome = runPartialHandler(handler, {
@@ -412,14 +413,12 @@ async function handlePartial(
   // (if handler didn't already do it).
   if (!handler && review.length > 0) {
     const overlay = applyReviewToWorktree(commit.sha, review, mirror.excludePaths);
-    if (overlay === 'conflict') {
-      console.error(
-        `[mirror ${mirror.remote}]   (some review-path hunks left conflict markers; resolve before continuing)`,
-      );
-    } else if (overlay === 'error') {
+    if (overlay === 'error') {
       console.error(
         `[mirror ${mirror.remote}]   (failed to overlay review paths; inspect with: git show ${commit.sha.slice(0, 8)})`,
       );
+    } else {
+      printOverlayNote(mirror.remote, overlay);
     }
   }
 
@@ -476,6 +475,7 @@ function handlePureReview(
     console.error(`[mirror ${mirror.remote}] Failed to apply review overlay to worktree.`);
     return { kind: 'error' };
   }
+  printOverlayNote(mirror.remote, overlay);
 
   // Capture source metadata for a potential re-commit on continue.
   const meta = readCommitMeta(sha);
@@ -612,6 +612,37 @@ function printAmStopMessage(remote: string): void {
   console.error(`    git-auto-remote mirror skip     ${remote}   # drop this commit and continue`);
   console.error(`    git am --show-current-patch=diff              # inspect the failing patch`);
   console.error(`    git am --abort                                # bail out entirely`);
+}
+
+/**
+ * Emit a contextual note about what the review overlay did. Called after the
+ * overlay step so the pause-message reader understands what state the
+ * worktree is in.
+ *
+ *   'applied'  - primary `git apply --3way` succeeded; worktree has clean
+ *                unstaged delta. No extra note needed (default pause message
+ *                explains "Review (in worktree, unstaged)").
+ *
+ *   'conflict' - `--3way` left conflict markers. User resolves + git add.
+ *
+ *   'fallback' - `--3way` refused the diff entirely (base content missing);
+ *                tool wrote source's verbatim version into the worktree. The
+ *                visible `git diff` shows the FULL delta from local to source
+ *                (not just what the source commit changed). Stage hunks the
+ *                user wants.
+ */
+function printOverlayNote(remote: string, mode: 'applied' | 'conflict' | 'fallback'): void {
+  if (mode === 'conflict') {
+    console.error(`[mirror ${remote}]   (some review-path hunks left conflict markers; resolve before continuing)`);
+    return;
+  }
+  if (mode === 'fallback') {
+    console.error(`[mirror ${remote}]   (review-path diff did not apply cleanly - worktree now has source's`);
+    console.error(`[mirror ${remote}]    version verbatim. 'git diff' shows the FULL local->source delta for`);
+    console.error(`[mirror ${remote}]    each review path, not just this commit's change. Stage what you want.)`);
+    return;
+  }
+  // 'applied': nothing extra; default pause message is clear enough.
 }
 
 function printPartialHeader(
