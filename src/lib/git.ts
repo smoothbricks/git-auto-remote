@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -167,9 +167,52 @@ export function listCommitsInRange(from: string, to: string): string[] {
   return out.split('\n').filter((line) => line.length > 0);
 }
 
-/** Paths changed by a single commit (`git diff-tree --name-only`). */
+/**
+ * True iff `sha` resolves to a root commit - i.e. has no parent. Probed by
+ * asking `git rev-parse --verify --quiet <sha>^`, which succeeds when a
+ * parent exists and fails when it doesn't (root commits). Used to decide
+ * whether the bootstrap target should be included in the replay stream:
+ * for non-root bootstraps, `listCommitsInRange(<tracking>, <head>)` excludes
+ * `<tracking>` which is correct (caller asserts its content is already
+ * reflected locally); for root bootstraps, excluding would lose the root's
+ * content entirely since there's no prior commit establishing it.
+ */
+export function isRootCommit(sha: string): boolean {
+  return gitTry('rev-parse', '--verify', '--quiet', `${sha}^`) === null;
+}
+
+/**
+ * Read the `From <40-char-sha>` header of the patch `git am` is currently
+ * stopped on. Returns null if no am is in progress, if the expected files
+ * don't exist, or if the patch header can't be parsed.
+ *
+ * Shared between `mirror-skip` (to know what SHA to advance the tracking
+ * ref to after `git am --skip`) and `mirror-pull`'s conflict-pause message
+ * (to tell the user which commit they're stuck on without digging into
+ * `.git/rebase-apply/` by hand).
+ */
+export function readCurrentPatchSha(): string | null {
+  const applyDir = join(gitDir(), 'rebase-apply');
+  const nextPath = join(applyDir, 'next');
+  if (!existsSync(nextPath)) return null;
+  const next = Number.parseInt(readFileSync(nextPath, 'utf8').trim(), 10);
+  if (!Number.isFinite(next) || next < 1) return null;
+  const patchFile = join(applyDir, String(next).padStart(4, '0'));
+  if (!existsSync(patchFile)) return null;
+  const firstLine = readFileSync(patchFile, 'utf8').split('\n', 1)[0];
+  const match = firstLine.match(/^From\s+([0-9a-f]{40})\s+/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Paths changed by a single commit (`git diff-tree --name-only`).
+ *
+ * `--root` makes root commits report all paths added (rather than returning
+ * empty, which would classify them as out-of-scope). Safe on non-root
+ * commits - for those it just shows the normal parent-vs-commit diff.
+ */
 export function changedPaths(sha: string): string[] {
-  const out = gitTry('diff-tree', '--no-commit-id', '--name-only', '-r', sha);
+  const out = gitTry('diff-tree', '--root', '--no-commit-id', '--name-only', '-r', sha);
   if (!out) return [];
   return out.split('\n').filter((line) => line.length > 0);
 }

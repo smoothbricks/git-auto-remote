@@ -20,8 +20,10 @@ import {
   hasStagedChanges,
   hasUnresolvedMergeConflicts,
   isAncestorOf,
+  isRootCommit,
   listCommitsInRange,
   readCommitMeta,
+  readCurrentPatchSha,
   revParse,
   workingTreeDirty,
 } from '../lib/git.js';
@@ -162,6 +164,16 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     regeneratePaths: mirror.regeneratePaths,
   };
   const shas = listCommitsInRange(last, head);
+  // When the bootstrap target IS a root commit, `listCommitsInRange` (which
+  // uses `<last>..<to>` semantics, excluding `<last>`) would skip the root's
+  // own content - meaning any file private creates in its root commit never
+  // lands in public's HEAD, and subsequent commits referring to that content
+  // hit modify/delete conflicts. Prepend the root to the replay stream so it
+  // gets applied first. For non-root bootstraps the caller asserts the
+  // content is already locally present so exclusion is correct.
+  if (isRootCommit(last)) {
+    shas.unshift(last);
+  }
   const classified: ClassifiedCommit[] = shas.map((sha) => ({
     sha,
     classification: classify(changedPaths(sha), pathSpec),
@@ -598,17 +610,25 @@ function finalizePureReviewAsResolved(
  * there are no conflict markers is confusing and wastes time.
  */
 function printAmStopMessage(remote: string): void {
+  // Identify which commit is currently stuck so the user doesn't have to
+  // grep .git/rebase-apply/ themselves. Format: `abc12345 subject line`.
+  // Missing SHA/subject degrade gracefully to the prior generic wording.
+  const stuckSha = readCurrentPatchSha();
+  const stuckLabel = stuckSha
+    ? `${stuckSha.slice(0, 8)} ${commitSubject(stuckSha) || '(unknown subject)'}`
+    : 'current patch';
+
   if (hasUnresolvedMergeConflicts()) {
-    console.error(`[mirror ${remote}] Conflict during apply. Resolve the conflicts, git add, then one of:`);
+    console.error(`[mirror ${remote}] Conflict applying ${stuckLabel}`);
+    console.error(`[mirror ${remote}]   Resolve the conflicts, git add, then one of:`);
     console.error(`    git-auto-remote mirror continue ${remote}`);
     console.error(`    git-auto-remote mirror skip     ${remote}   # drop this commit`);
     return;
   }
-  console.error(`[mirror ${remote}] 'git am' stopped structurally - the patch references content missing from HEAD`);
-  console.error(
-    `[mirror ${remote}]   (e.g. a rename from a path not present, or a mode change on a file that wasn't synced).`,
-  );
-  console.error(`[mirror ${remote}]   Working tree is clean; there are no conflict markers to resolve.`);
+  console.error(`[mirror ${remote}] 'git am' stopped structurally on ${stuckLabel}`);
+  console.error(`[mirror ${remote}]   The patch references content missing from HEAD (e.g. a rename from a path`);
+  console.error(`[mirror ${remote}]   not present, or a mode change on a file that wasn't synced). Working tree`);
+  console.error(`[mirror ${remote}]   is clean; there are no conflict markers to resolve.`);
   console.error(`    git-auto-remote mirror skip     ${remote}   # drop this commit and continue`);
   console.error(`    git am --show-current-patch=diff              # inspect the failing patch`);
   console.error(`    git am --abort                                # bail out entirely`);

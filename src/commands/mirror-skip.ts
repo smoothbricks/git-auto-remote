@@ -1,7 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { amInProgress, commitSubject, git, gitDir, gitTry } from '../lib/git.js';
+import { amInProgress, commitSubject, git, gitTry, readCurrentPatchSha } from '../lib/git.js';
 import {
   clearMirrorInProgress,
   clearPendingCommit,
@@ -41,9 +39,7 @@ export async function mirrorSkip(remoteArg?: string): Promise<number> {
   }
   const remote = remoteArg ?? review.remote;
   if (remote !== review.remote) {
-    console.error(
-      `[git-auto-remote] Pending review is for '${review.remote}', not '${remote}'.`,
-    );
+    console.error(`[git-auto-remote] Pending review is for '${review.remote}', not '${remote}'.`);
     return 1;
   }
 
@@ -54,27 +50,21 @@ export async function mirrorSkip(remoteArg?: string): Promise<number> {
     gitTry('clean', '-fd', '--', ...review.review);
     git('reset', '--hard', 'HEAD~1');
     clearReviewPending();
-    console.error(
-      `[git-auto-remote] Skipped ${review.sourceSha.slice(0, 8)} (${review.subject}); resuming.`,
-    );
+    console.error(`[git-auto-remote] Skipped ${review.sourceSha.slice(0, 8)} (${review.subject}); resuming.`);
     return mirrorPull({ remote });
   }
   if (review.phase === 'pure-review-pause') {
     discardReviewPaths(review.review);
     clearPendingCommit();
     clearReviewPending();
-    console.error(
-      `[git-auto-remote] Skipped ${review.sourceSha.slice(0, 8)} (${review.subject}); resuming.`,
-    );
+    console.error(`[git-auto-remote] Skipped ${review.sourceSha.slice(0, 8)} (${review.subject}); resuming.`);
     return mirrorPull({ remote });
   }
   // phase === 'am-in-progress' but am is not in progress anymore. Treat as if
   // the user is trying to skip the review transition: behave like review-pause
   // skip (reset HEAD~1 to undo the included-subset commit if any was made).
   // This is a weird state; log and do the safest thing.
-  console.error(
-    `[git-auto-remote] Pause says 'am-in-progress' but no git am is running; skipping by reset HEAD~1.`,
-  );
+  console.error(`[git-auto-remote] Pause says 'am-in-progress' but no git am is running; skipping by reset HEAD~1.`);
   gitTry('clean', '-fd', '--', ...review.review);
   git('reset', '--hard', 'HEAD~1');
   clearReviewPending();
@@ -98,25 +88,18 @@ async function skipAm(remoteArg?: string): Promise<number> {
   const sentinelRemote = getMirrorInProgress();
   const remote = sentinelRemote ?? remoteArg;
   if (!remote) {
-    console.error(
-      `[git-auto-remote] 'git am' is in progress but no mirror sentinel set and no remote given.`,
-    );
+    console.error(`[git-auto-remote] 'git am' is in progress but no mirror sentinel set and no remote given.`);
     console.error(`Usage: git-auto-remote mirror skip <remote>`);
     return 1;
   }
   if (remoteArg && sentinelRemote && sentinelRemote !== remoteArg) {
-    console.error(
-      `[git-auto-remote] sentinel says am is for '${sentinelRemote}', not '${remoteArg}'.`,
-    );
+    console.error(`[git-auto-remote] sentinel says am is for '${sentinelRemote}', not '${remoteArg}'.`);
     return 1;
   }
 
-  const applyDir = join(gitDir(), 'rebase-apply');
-  const skipSha = readCurrentPatchSha(applyDir);
+  const skipSha = readCurrentPatchSha();
   if (!skipSha) {
-    console.error(
-      `[git-auto-remote] Could not determine the source SHA of the current patch in ${applyDir}.`,
-    );
+    console.error(`[git-auto-remote] Could not determine the source SHA of the current patch in .git/rebase-apply/.`);
     return 1;
   }
 
@@ -128,9 +111,7 @@ async function skipAm(remoteArg?: string): Promise<number> {
   }
 
   updateTrackingRef(remote, skipSha);
-  console.error(
-    `[mirror ${remote}] skipped ${skipSha.slice(0, 8)}${subject ? ` (${subject})` : ''}`,
-  );
+  console.error(`[mirror ${remote}] skipped ${skipSha.slice(0, 8)}${subject ? ` (${subject})` : ''}`);
 
   if (amInProgress()) {
     console.error(
@@ -148,18 +129,6 @@ async function skipAm(remoteArg?: string): Promise<number> {
   }
   clearMirrorInProgress();
   return mirrorPull({ remote });
-}
-
-function readCurrentPatchSha(applyDir: string): string | null {
-  const nextPath = join(applyDir, 'next');
-  if (!existsSync(nextPath)) return null;
-  const next = Number.parseInt(readFileSync(nextPath, 'utf8').trim(), 10);
-  if (!Number.isFinite(next) || next < 1) return null;
-  const patchFile = join(applyDir, String(next).padStart(4, '0'));
-  if (!existsSync(patchFile)) return null;
-  const firstLine = readFileSync(patchFile, 'utf8').split('\n', 1)[0];
-  const match = firstLine.match(/^From\s+([0-9a-f]{40})\s+/);
-  return match ? match[1] : null;
 }
 
 /**

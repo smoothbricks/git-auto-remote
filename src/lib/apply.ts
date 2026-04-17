@@ -284,14 +284,25 @@ function writeSourceVerbatim(sha: string, paths: readonly string[]): boolean {
   return true;
 }
 
-/** Pretty-print "Applying: <subject>" lines, mimicking `git am`'s own output. */
+/**
+ * Announce the commits about to be (or not) applied in this range. Output is
+ * two-column aligned so the short SHA column is easy to scan:
+ *
+ *     [mirror private] Applying: abc12345  feat: add new feature
+ *     [mirror private] Skipping: def67890  chore: housekeeping  (out of scope)
+ *
+ * The SHA makes pinpointing a stuck patch trivial - no more digging through
+ * `.git/rebase-apply/` to figure out which "Applying: subject" line
+ * corresponds to which commit.
+ */
 export function printApplyingLines(commits: readonly ClassifiedCommit[], remote: string): void {
   for (const c of commits) {
     const subject = commitSubject(c.sha);
+    const shortSha = c.sha.slice(0, 8);
     if (c.classification.kind === 'out-of-scope') {
-      console.error(`[mirror ${remote}] Skipping (out of scope): ${subject}`);
+      console.error(`[mirror ${remote}] Skipping: ${shortSha}  ${subject}  (out of scope)`);
     } else {
-      console.error(`[mirror ${remote}] Applying: ${subject}`);
+      console.error(`[mirror ${remote}] Applying: ${shortSha}  ${subject}`);
     }
   }
 }

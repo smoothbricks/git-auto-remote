@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installHook } from '../src/lib/hooks.js';
@@ -40,9 +40,7 @@ function git(cwd: string, ...args: string[]): string {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.status !== 0) {
-    throw new Error(
-      `git ${args.join(' ')} failed in ${cwd}:\n${result.stdout}\n${result.stderr}`,
-    );
+    throw new Error(`git ${args.join(' ')} failed in ${cwd}:\n${result.stdout}\n${result.stderr}`);
   }
   return (result.stdout ?? '').trim();
 }
@@ -174,7 +172,10 @@ describe('mirror pull', () => {
 
     test('--non-interactive stops with exit 2 and does not commit the partial', async () => {
       const headBefore = git(local, 'rev-parse', 'HEAD');
-      const code = await mirrorPull({ remote: 'upstream', nonInteractive: true });
+      const code = await mirrorPull({
+        remote: 'upstream',
+        nonInteractive: true,
+      });
       expect(code).toBe(2);
       // Partial was applied then reset, so HEAD is unchanged.
       expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
@@ -327,7 +328,7 @@ describe('mirror pull with excludePaths', () => {
   });
 });
 
-describe("out-of-scope commits do NOT leak patches from ancestors (v0.3.6 regression)", () => {
+describe('out-of-scope commits do NOT leak patches from ancestors (v0.3.6 regression)', () => {
   test("an out-of-scope commit produces an empty patch; ancestor's patch is NOT replayed", async () => {
     const seed = join(root, 'seed');
     // Commit A (ancestor, in-scope): touches packages/.
@@ -359,7 +360,7 @@ describe("out-of-scope commits do NOT leak patches from ancestors (v0.3.6 regres
     expect(existsSync(join(local, '.git/rebase-apply'))).toBe(false);
   });
 
-  test("simulated post-skip state: out-of-scope commit between in-scope ancestor and descendant does NOT replay the ancestor", async () => {
+  test('simulated post-skip state: out-of-scope commit between in-scope ancestor and descendant does NOT replay the ancestor', async () => {
     const seed = join(root, 'seed');
     // P: partial commit we pretend was just skipped. Touches packages/cli/a.ts + README.
     writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A PRETEND-SKIPPED\n');
@@ -406,12 +407,7 @@ describe('mirror pull with root commits on the mirror', () => {
     git(local, 'update-ref', TRACKING_UPSTREAM, localRoot);
 
     // Confirm rev-list now includes upstream's root.
-    const rangeOut = git(
-      local,
-      'rev-list',
-      '--reverse',
-      `${localRoot}..upstream/main`,
-    ).split('\n');
+    const rangeOut = git(local, 'rev-list', '--reverse', `${localRoot}..upstream/main`).split('\n');
     expect(rangeOut[0]).toBe(upstreamRoot); // first commit in range IS the root
 
     // The replay should succeed - the fix switches `format-patch first^..last` to
@@ -424,5 +420,61 @@ describe('mirror pull with root commits on the mirror', () => {
     // so an empty patch was dropped - the important assertion is that no error
     // surfaced from `format-patch root^..`).
     expect(existsSync(join(local, 'packages/cli/a.ts'))).toBe(true);
+  });
+
+  /**
+   * v0.5.3 regression: when the tracking ref IS a root commit (bootstrap at
+   * the very first commit of the mirror's history, for a "fresh clone with
+   * no prior content" setup), the root commit's own content must land on
+   * local HEAD. Before this fix, `listCommitsInRange(<root>, <head>)` used
+   * `<root>..<head>` which EXCLUDED the root - so every file the mirror
+   * created in its root commit was missing from local's HEAD, and any
+   * subsequent commit that modified those files hit modify/delete conflicts.
+   */
+  test('bootstrap at a root commit INCLUDES the root in the replay', async () => {
+    // Build a fresh "empty-scaffold local" that lacks the mirror's root content.
+    const freshLocal = join(root, 'fresh-local');
+    git(root, 'init', '-q', freshLocal);
+    // Seed with an unrelated scaffold commit so local has a HEAD that's on
+    // a different history line from upstream's root.
+    mkdirSync(join(freshLocal, '.'), { recursive: true });
+    writeFileSync(join(freshLocal, 'LOCAL-SCAFFOLD'), 'scaffold\n');
+    git(freshLocal, 'add', '-A');
+    git(freshLocal, 'commit', '-q', '-m', 'local: scaffold');
+    git(freshLocal, 'branch', '-M', 'private');
+    git(freshLocal, 'remote', 'add', 'upstream', upstream);
+    git(freshLocal, 'fetch', '-q', 'upstream');
+
+    // Configure as a mirror of the upstream.
+    git(freshLocal, 'config', 'auto-remote.upstream.syncPaths', 'packages');
+    git(freshLocal, 'config', 'auto-remote.upstream.syncTargetBranch', 'private');
+    git(freshLocal, 'config', 'auto-remote.upstream.syncBranch', 'main');
+    git(freshLocal, 'config', 'auto-remote.upstream.pushSyncRef', 'false');
+
+    // Bootstrap tracking at upstream's ACTUAL root commit.
+    const upstreamRoot = git(join(root, 'seed'), 'rev-list', '--max-parents=0', 'HEAD');
+    git(freshLocal, 'update-ref', TRACKING_UPSTREAM, upstreamRoot);
+
+    // Pre-state assertion: local HEAD does NOT have packages/cli/a.ts.
+    expect(existsSync(join(freshLocal, 'packages/cli/a.ts'))).toBe(false);
+
+    // Run mirror pull from this fresh local.
+    const savedCwd = process.cwd();
+    process.chdir(freshLocal);
+    try {
+      const code = await mirrorPull({ remote: 'upstream' });
+      expect(code).toBe(0);
+    } finally {
+      process.chdir(savedCwd);
+    }
+
+    // Post-state: root commit's content landed. This is the whole point of
+    // the v0.5.3 root-inclusive fix.
+    expect(existsSync(join(freshLocal, 'packages/cli/a.ts'))).toBe(true);
+    expect(readFileSync(join(freshLocal, 'packages/cli/a.ts'), 'utf8')).toBe('pkg A v1\n');
+    // And the subsequent commits on upstream (pkg: add B, docs: add readme)
+    // are also handled: b.ts landed, README.md is out-of-scope (no sync match).
+    expect(readFileSync(join(freshLocal, 'packages/cli/b.ts'), 'utf8')).toBe('pkg B v1\n');
+    expect(existsSync(join(freshLocal, 'README.md'))).toBe(false);
   });
 });
