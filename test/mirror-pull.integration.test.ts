@@ -327,6 +327,73 @@ describe('mirror pull with excludePaths', () => {
   });
 });
 
+describe("out-of-scope commits do NOT leak patches from ancestors (v0.3.6 regression)", () => {
+  test("an out-of-scope commit produces an empty patch; ancestor's patch is NOT replayed", async () => {
+    const seed = join(root, 'seed');
+    // Commit A (ancestor, in-scope): touches packages/.
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A v2 upstream\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'ANCESTOR: in scope');
+    // Commit B (descendant, out-of-scope): only touches README.md.
+    writeFileSync(join(seed, 'README.md'), 'just a readme tweak\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'docs: readme tweak');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    // Advance tracking ref PAST A so A is already "synced" from the tool's POV.
+    // B is then the only commit in the range - and it's out-of-scope.
+    const aSha = git(local, 'rev-parse', 'upstream/main~0^'); // parent of tip == A
+    git(local, 'update-ref', TRACKING_UPSTREAM, aSha);
+
+    const headBefore = git(local, 'rev-parse', 'HEAD');
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0);
+
+    // HEAD must NOT have moved. Critically: A's patch (ANCESTOR) must NOT
+    // have been replayed - which is exactly what `format-patch -1 B -- packages`
+    // would incorrectly do (walk back to A).
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+    const log = git(local, 'log', '--format=%s', `${headBefore}..HEAD`);
+    expect(log).toBe('');
+    expect(existsSync(join(local, '.git/rebase-apply'))).toBe(false);
+  });
+
+  test("simulated post-skip state: out-of-scope commit between in-scope ancestor and descendant does NOT replay the ancestor", async () => {
+    const seed = join(root, 'seed');
+    // P: partial commit we pretend was just skipped. Touches packages/cli/a.ts + README.
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A PRETEND-SKIPPED\n');
+    writeFileSync(join(seed, 'README.md'), 'readme v1\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'PRETEND-SKIPPED: must not reappear');
+    const pSha = git(seed, 'rev-parse', 'HEAD');
+    // O: out-of-scope (only README).
+    writeFileSync(join(seed, 'README.md'), 'readme v2\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'docs: O');
+    // C: clean new file in scope.
+    writeFileSync(join(seed, 'packages/cli/b.ts'), 'new file\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'feat: add B (clean)');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    // Simulate state immediately after `mirror am-skip` on P: tracking ref at P,
+    // HEAD untouched.
+    git(local, 'update-ref', TRACKING_UPSTREAM, pSha);
+
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0);
+
+    // C should have landed. P must NOT have reappeared as a "new" partial or
+    // conflict - the v0.3.5 bug regenerated P's patch via ancestor walk from O.
+    const log = git(local, 'log', '--format=%s', 'HEAD').split('\n');
+    expect(log).toContain('feat: add B (clean)');
+    expect(log).not.toContain('PRETEND-SKIPPED: must not reappear');
+    expect(existsSync(join(local, '.git/rebase-apply'))).toBe(false);
+  });
+});
+
 describe('mirror pull with root commits on the mirror', () => {
   test("can replay the mirror's root commit (regression: format-patch first^..last)", async () => {
     // Build a fresh pair where we DO NOT bootstrap from upstream's tip; instead
