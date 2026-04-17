@@ -55,8 +55,8 @@ git-auto-remote mirror bootstrap public <sha-whose-tree-matches-current-packages
 |---|---|---|
 | `fork-remote.<name>.syncPaths` | Space-separated pathspecs to include when cherry-picking. Presence (either here or via `syncPathsFile`) makes the remote a mirror. | *required* |
 | `fork-remote.<name>.syncPathsFile` | Repo-relative path to a newline-separated file of sync paths. Supports `#` comments. Contents union with `syncPaths`. | *(none)* |
-| `fork-remote.<name>.excludePaths` / `.excludePathsFile` | Pathspecs that are **never** synced, even if under `syncPaths`. Useful for repo-local-only files that live in a shared directory. | *(none)* |
-| `fork-remote.<name>.reviewPaths` / `.reviewPathsFile` | Pathspecs (subset of `syncPaths`) whose changes **always** trigger a partial review pause, even when the rest of the commit is clean. | *(none)* |
+| `fork-remote.<name>.excludePaths` / `.excludePathsFile` | Pathspecs that are **never** synced, even if under `syncPaths`. Useful for repo-local-only files that live in a shared directory. Dropped silently from the commit; no pause. | *(none)* |
+| `fork-remote.<name>.reviewPaths` / `.reviewPathsFile` | Pathspecs whose changes are **brought into the worktree as unstaged** at pause time so the user can `git add -p` / `git restore` / `git commit --amend --no-edit`. Orthogonal to `syncPaths` — a path may be a reviewPath without being a syncPath. Author + author-date are preserved across amends. | *(none)* |
 | `fork-remote.<name>.syncBranch` | Remote branch to pull from. | `<remote>/HEAD`, else `main` |
 | `fork-remote.<name>.syncTargetBranch` | Local branch that receives replayed commits. | `<remote>` |
 | `fork-remote.<name>.partialHandler` | Path to a script that resolves "partial" commits. | *(none)* |
@@ -64,39 +64,53 @@ git-auto-remote mirror bootstrap public <sha-whose-tree-matches-current-packages
 
 ### Per-commit classification
 
-Each mirror commit is classified by comparing its changed paths against the path config:
+Each changed path in a mirror commit is sorted into exactly ONE bucket, in priority order:
 
-1. Paths matching any `excludePath` are **dropped entirely** — they do not count as included or excluded.
-2. Remaining paths matching `syncPaths` are **included**.
-3. Remaining paths are **excluded** (outside the sync surface).
-4. Any included path matching a `reviewPath` flags the commit as review-required.
+1. matches `excludePaths` → **dropped entirely** (never in HEAD, never in worktree, not reported)
+2. matches `reviewPaths` → **review** (overlaid to the worktree unstaged at pause time)
+3. matches `syncPaths` → **included** (applied to HEAD by `git am`, author + author-date preserved)
+4. none of the above → **outside** (silently dropped like `excludePaths`, but reported in the pause message so you notice)
 
-| Situation | Classification | Action |
+`reviewPaths` is first-class and independent of `syncPaths` — a path can be a reviewPath without being a syncPath. Canonical use: `bun.lock` flagged for review but never auto-synced.
+
+| Classification | When | Action |
 |---|---|---|
-| 0 included paths | **Out-of-scope** | empty patch, dropped |
-| all included, 0 excluded, 0 review-required | **Clean** | included in a batched `git am` run |
-| otherwise (any excluded OR any review-required) | **Partial** | breaks the batch; applied alone; paused for review |
+| **Out-of-scope** | both `included` and `review` empty (no content for the tool to act on) | commit skipped, tracking ref advances |
+| **Clean** | only `included` non-empty | included in a batched `git am` run |
+| **Partial** | any `review`, any `outside`, or mixed | breaks the batch; paused for review |
 
 A batched run of clean + out-of-scope commits is applied via a single `git format-patch ... | git am --empty=drop --3way`.
 
 ### Partial commit review (interactive)
 
-When a partial is encountered, its in-scope changes are applied as a commit and the tool pauses:
+When a partial is encountered, the tool:
+
+1. Applies the `included` subset to HEAD via `git am` (author + author-date preserved).
+2. Overlays the `review` subset into the worktree as **unstaged** modifications (via `git apply --3way`).
+3. Pauses for review.
 
 ```
 [mirror public] Partial: feat: shared lib + private glue (abc1234)
-  Excluded paths: package.json, privpkgs/foo.ts
-  Review-required paths: tooling/workspace.gitconfig
-  Review:    git show HEAD
-  Amend:     git commit --amend    (optionally include excluded content)
+  Review (in worktree, unstaged): bun.lock, tooling/workspace.gitconfig
+  Outside sync scope (dropped):   privpkgs/foo.ts
+
+  Review:    git diff                       # see unstaged review content
+  Stage:     git add -p                     # pick hunks into the commit
+  Discard:   git restore <paths>            # drop review hunks
   Continue:  git-auto-remote mirror continue public
   Skip:      git-auto-remote mirror skip public
 ```
 
-Either list is printed only if non-empty.
+Lines with empty lists are omitted.
 
-- `mirror continue <remote>` — resume with whatever amendments you made
-- `mirror skip <remote>` — drop the partial (resets HEAD~1) and resume past it
+- `mirror continue <remote>` — if you staged any review hunks, amends HEAD with them (author + author-date preserved by `--amend --no-edit`); any leftover unstaged review content is discarded. Resumes the sync from there.
+- `mirror skip <remote>` — discards the worktree overlay and resets HEAD past the partial commit. Tracking ref already points past the source SHA, so the next pull resumes past it too.
+
+Both commands are unified across three pause sub-cases:
+
+- **am-conflict** — the `included` patch wouldn't apply cleanly; resolve conflicts in the normal `git am` way, then `mirror continue`
+- **review-pause** — `included` landed; `review` awaits in the worktree
+- **pure-review-pause** — the source touched ONLY review paths, no HEAD commit was made; staging + `mirror continue` creates a fresh commit preserving the source's author/email/date/message
 
 ### Non-interactive mode (CI)
 
@@ -134,14 +148,15 @@ The handler is invoked with the partial's subset already applied to HEAD. It may
 Handler receives the following env vars:
 
 ```
-MIRROR_REMOTE            public
-MIRROR_SOURCE_SHA        abc1234...
-MIRROR_SOURCE_SUBJECT    feat: shared lib + private glue
-MIRROR_INCLUDED_PATHS    newline-separated
-MIRROR_EXCLUDED_PATHS    newline-separated
+MIRROR_REMOTE           public
+MIRROR_SOURCE_SHA       abc1234...
+MIRROR_SOURCE_SUBJECT   feat: shared lib + private glue
+MIRROR_INCLUDED_PATHS   newline-separated (already in HEAD)
+MIRROR_REVIEW_PATHS     newline-separated (in worktree, unstaged)
+MIRROR_OUTSIDE_PATHS    newline-separated (dropped, not in HEAD or worktree)
 ```
 
-And positional args: `<remote> <source-sha>`. Full source diff available via `git show $MIRROR_SOURCE_SHA`.
+And positional args: `<remote> <source-sha>`. Full source diff available via `git show $MIRROR_SOURCE_SHA`. The handler is invoked with HEAD at the `included` subset (or unchanged for pure-review-only sources) and review paths as unstaged worktree changes, so typical operations are `git add -p && git commit --amend --no-edit` or `git restore`.
 
 ### Tracking-ref durability
 
@@ -159,8 +174,8 @@ git-auto-remote mirror list               Show configured mirrors
 git-auto-remote mirror status [<remote>]  Show sync state
 git-auto-remote mirror bootstrap <remote> <sha> [--force]
 git-auto-remote mirror pull [<remote>] [--non-interactive] [--on-partial <cmd>]
-git-auto-remote mirror continue [<remote>]
-git-auto-remote mirror skip [<remote>]
+git-auto-remote mirror continue [<remote>]     # resolve any pause sub-case
+git-auto-remote mirror skip [<remote>]         # skip the paused commit
 ```
 
 ## Bypassing auto-routing on push

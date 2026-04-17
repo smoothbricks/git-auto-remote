@@ -3,22 +3,26 @@
  * range into clean batches, out-of-scope commits, and partial commits that
  * need human (or handler) review.
  *
- * Each changed path falls into one of three buckets:
+ * Each changed path is sorted into exactly ONE of four buckets, in priority order:
  *
- *   excludePaths (highest priority) -> dropped entirely: not included, not excluded.
- *                                      Never makes it into the patch.
- *   syncPaths                       -> included
- *   neither                         -> excluded (leaks private content if synced)
+ *   1. matches `excludePaths`  -> dropped entirely (invisible to the rest of the pipeline)
+ *   2. matches `reviewPaths`   -> `review`   (brought to worktree unstaged at pause time)
+ *   3. matches `syncPaths`     -> `included` (applied to HEAD by `git am`)
+ *   4. none of the above       -> `outside`  (the "you forgot about this" bucket; dropped
+ *                                              from HEAD and worktree, but surfaced in the
+ *                                              pause message so the user can see it)
+ *
+ * `reviewPaths` is first-class and independent of `syncPaths`: a path may be a reviewPath
+ * WITHOUT also being a syncPath (e.g. bun.lock configured to review but never auto-applied).
  *
  * A commit's classification:
  *
- *   no included paths                                       -> out-of-scope
- *   all included, none excluded, no review-required         -> clean
- *   otherwise (any excluded OR any review-required included) -> partial
- *
- * `reviewPaths` is a subset of paths within `included` whose changes should
- * always trigger a review pause, even when no excluded paths are touched.
- * Useful for shared files that are sensitive (e.g. workspace git config).
+ *   included and review both empty    -> out-of-scope (nothing for the tool to do;
+ *                                        any `outside` content gets silently dropped
+ *                                        with the commit itself)
+ *   only `included` non-empty         -> clean (auto-apply)
+ *   otherwise                         -> partial (pause for review; three sub-cases
+ *                                        distinguished at runtime by mirror-pull.ts)
  */
 
 export type PathSpec = {
@@ -33,8 +37,8 @@ export type Classification =
   | {
       kind: 'partial';
       included: readonly string[];
-      excluded: readonly string[];
-      reviewRequired: readonly string[];
+      review: readonly string[];
+      outside: readonly string[];
     };
 
 /**
@@ -43,20 +47,34 @@ export type Classification =
  */
 export function classify(changedPaths: readonly string[], spec: PathSpec): Classification {
   const included: string[] = [];
-  const excluded: string[] = [];
+  const review: string[] = [];
+  const outside: string[] = [];
+
   for (const p of changedPaths) {
-    if (matchesAny(p, spec.excludePaths)) continue; // dropped entirely
-    if (matchesAny(p, spec.syncPaths)) included.push(p);
-    else excluded.push(p);
+    if (matchesAny(p, spec.excludePaths)) continue; // bucket 1: dropped
+    if (matchesAny(p, spec.reviewPaths)) {
+      review.push(p); // bucket 2: review
+      continue;
+    }
+    if (matchesAny(p, spec.syncPaths)) {
+      included.push(p); // bucket 3: included
+      continue;
+    }
+    outside.push(p); // bucket 4: outside
   }
 
-  if (included.length === 0) return { kind: 'out-of-scope' };
-
-  const reviewRequired = included.filter((p) => matchesAny(p, spec.reviewPaths));
-  if (excluded.length === 0 && reviewRequired.length === 0) {
+  // If there's nothing the tool can actually act on (no included, no review),
+  // the commit is out-of-scope - any `outside` content gets silently dropped
+  // along with the commit. This matches the intuition "if none of this commit
+  // would land in HEAD or in the worktree, don't bother the user".
+  if (included.length === 0 && review.length === 0) {
+    return { kind: 'out-of-scope' };
+  }
+  // Purely in-scope commit: auto-apply.
+  if (review.length === 0 && outside.length === 0) {
     return { kind: 'clean', included };
   }
-  return { kind: 'partial', included, excluded, reviewRequired };
+  return { kind: 'partial', included, review, outside };
 }
 
 /** Path-prefix match: `path === spec` or `path` begins with `spec + '/'`. */

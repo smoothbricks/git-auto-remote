@@ -113,6 +113,23 @@ export function workingTreeDirty(): boolean {
   return out !== null && out.length > 0;
 }
 
+/**
+ * True iff the index differs from HEAD (i.e. `git commit` would produce a
+ * non-empty commit). `git diff --cached --quiet` exits 0 when clean, 1 when
+ * dirty, and we need the exit code directly (gitTry collapses both to its
+ * string-or-null contract).
+ */
+export function hasStagedChanges(): boolean {
+  try {
+    execFileSync('git', ['diff', '--cached', '--quiet'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 /** SHAs of commits in the range `from..to`, oldest-first (topological order). */
 export function listCommitsInRange(from: string, to: string): string[] {
   const out = gitTry('rev-list', '--reverse', '--topo-order', `${from}..${to}`);
@@ -130,6 +147,39 @@ export function changedPaths(sha: string): string[] {
 /** Subject line of a commit. */
 export function commitSubject(sha: string): string {
   return gitTry('log', '-1', '--format=%s', sha) ?? '';
+}
+
+/**
+ * Read author name/email/date + full commit message for a commit. Fields are
+ * NUL-separated (%x00) so commit messages with arbitrary whitespace survive
+ * intact. Author date is ISO-strict (%aI) - round-trippable via GIT_AUTHOR_DATE.
+ *
+ * Used by the pure-review-pause code path where we need to re-create a commit
+ * from scratch while preserving the source's author + author-date.
+ */
+export type CommitMeta = {
+  authorName: string;
+  authorEmail: string;
+  authorDate: string;
+  message: string;
+};
+
+export function readCommitMeta(sha: string): CommitMeta {
+  // execFileSync directly so we keep the raw message (no .trim() surprise).
+  const out = execFileSync(
+    'git',
+    ['show', '-s', '--format=%an%x00%ae%x00%aI%x00%B', sha],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  // split with limit 4: first 3 are name/email/date, everything else is message
+  // (rejoined with NUL so we don't lose any separator that happened to be in msg).
+  const parts = out.split('\x00');
+  const [authorName = '', authorEmail = '', authorDate = '', ...rest] = parts;
+  // `git show -s --format=%B` appends a single newline after the commit body,
+  // and git itself adds a final newline after format output. Strip ALL trailing
+  // newlines so `git commit -m <msg>` produces a canonical message.
+  const message = rest.join('\x00').replace(/\n+$/, '');
+  return { authorName, authorEmail, authorDate, message };
 }
 
 /** Quiet `git fetch <remote>`; throws GitError on failure. */
