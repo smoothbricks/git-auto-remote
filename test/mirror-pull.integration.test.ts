@@ -1182,4 +1182,100 @@ describe('mirror pull with root commits on the mirror', () => {
       expect(fetchRefspecs).toContain('+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*');
     });
   });
+
+  // v0.7.0 HIGH-6 (see 2026-04-18-audit.md): merge-in-progress safety
+  describe('when MERGE_HEAD exists (merge in progress)', () => {
+    beforeEach(() => {
+      // Start a merge but don't commit
+      const seed = join(root, 'seed');
+      commit(seed, 'packages/cli/c.ts', 'pkg C v1\n', 'pkg: add C');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      // Start a merge --no-commit, creating MERGE_HEAD
+      // Use --allow-unrelated-histories since local and upstream have disjoint histories
+      const mergeBase = git(local, 'rev-parse', 'upstream/main~1');
+      git(local, 'merge', '--no-commit', '--no-ff', '--allow-unrelated-histories', mergeBase);
+      // Verify MERGE_HEAD exists
+      expect(existsSync(join(local, '.git', 'MERGE_HEAD'))).toBe(true);
+    });
+
+    test('refuses with exit 1 and clear message (T2-MPULL-01)', async () => {
+      const originalError = console.error;
+      const captured: string[] = [];
+      console.error = (...args: unknown[]) => {
+        captured.push(args.join(' '));
+      };
+      let code: number;
+      try {
+        code = await mirrorPull({ remote: 'upstream' });
+      } finally {
+        console.error = originalError;
+      }
+      expect(code).toBe(1);
+      expect(captured.some((line) => line.includes('merge in progress'))).toBe(true);
+    });
+  });
+
+  // v0.7.0 CRIT-4 (see 2026-04-18-audit.md): fully-filtered range invariant test
+  describe('fully-filtered range (all commits empty after excludePaths)', () => {
+    beforeEach(() => {
+      // Configure excludePaths to cover ALL paths that upcoming commits touch
+      git(local, 'config', 'auto-remote.upstream.excludePaths', 'packages');
+      const seed = join(root, 'seed');
+      // Three commits that only touch packages/ (which is excluded)
+      commit(seed, 'packages/cli/x.ts', 'x\n', 'pkg: add X');
+      commit(seed, 'packages/cli/y.ts', 'y\n', 'pkg: add Y');
+      commit(seed, 'packages/cli/z.ts', 'z\n', 'pkg: add Z');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+    });
+
+    test('advances tracking and is idempotent (T2-MPULL-04)', async () => {
+      const upstreamTip = git(local, 'rev-parse', 'upstream/main');
+      // First pull: should advance tracking despite all commits being filtered
+      const code1 = await mirrorPull({ remote: 'upstream' });
+      expect(code1).toBe(0);
+      const trackingAfter1 = git(local, 'rev-parse', TRACKING_UPSTREAM);
+      expect(trackingAfter1).toBe(upstreamTip);
+      // Second pull: should be no-op (up to date)
+      const code2 = await mirrorPull({ remote: 'upstream' });
+      expect(code2).toBe(0);
+      const trackingAfter2 = git(local, 'rev-parse', TRACKING_UPSTREAM);
+      expect(trackingAfter2).toBe(upstreamTip);
+    });
+  });
+
+  // v0.7.0 CRIT-3 (see 2026-04-18-audit.md): stale sentinel handling
+  describe('when mirror-in-progress sentinel is set but no git am is running (stale sentinel)', () => {
+    beforeEach(async () => {
+      const seed = join(root, 'seed');
+      commit(seed, 'packages/cli/c.ts', 'pkg C v1\n', 'pkg: add C');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      // Manually set the sentinel (simulating a crash or interrupted state)
+      const { setMirrorInProgress } = await import('../src/lib/mirror-state.js');
+      setMirrorInProgress('upstream');
+      // Verify no am is actually in progress
+      const { amInProgress } = await import('../src/lib/git.js');
+      expect(amInProgress()).toBe(false);
+    });
+
+    test('refuses with exit 1 + exact stale-sentinel message (T2-MPULL-06)', async () => {
+      const originalError = console.error;
+      const captured: string[] = [];
+      console.error = (...args: unknown[]) => {
+        captured.push(args.join(' '));
+      };
+      let code: number;
+      try {
+        code = await mirrorPull({ remote: 'upstream' });
+      } finally {
+        console.error = originalError;
+      }
+      expect(code).toBe(1);
+      const staleMsg = '[git-auto-remote] stale mirror-in-progress sentinel for upstream but no git am running';
+      expect(captured.some((line) => line.includes(staleMsg))).toBe(true);
+      expect(captured.some((line) => line.includes('mirror skip'))).toBe(true);
+    });
+  });
 });
