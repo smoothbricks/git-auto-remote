@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { mirrorPull } from '../src/commands/mirror-pull.js';
 import { mirrorSkip } from '../src/commands/mirror-skip.js';
 import { installHook } from '../src/lib/hooks.js';
-import { trackingRefName } from '../src/lib/mirror-state.js';
+import { setReviewPending, trackingRefName } from '../src/lib/mirror-state.js';
 
 /**
  * End-to-end tests for `mirror skip`. Scenarios focus on v0.6.3 defect A:
@@ -257,6 +257,113 @@ describe('mirror skip: v0.6.3 defect A - every pause-skip path must explicitly a
       // subject - the skipped commit must not re-appear in HEAD.
       const headSubjects = git(local, 'log', '--format=%s', '-5').split('\n');
       expect(headSubjects).not.toContain('feat: bump A + review tweak');
+    });
+  });
+
+  describe('phase-mismatch safety (HIGH-2): am-in-progress marker with mismatched HEAD', () => {
+    /**
+     * v0.7.0 HIGH-2: If the marker says 'am-in-progress' but no git am is running,
+     * the fallback path resets HEAD~1. If the user manually created a commit
+     * between the original pause and invoking skip, this would silently drop
+     * the user's work. The fix: verify HEAD's commit subject/SHA matches what
+     * the marker expected before resetting.
+     *
+     * T2-MSKIP-01: Set 'am-in-progress' marker manually; create a commit on top
+     * of HEAD that's UNRELATED to the source SHA the marker references. Run
+     * `mirror skip`. Assert: refuses with explanatory error; does NOT reset HEAD~1.
+     */
+    test('refuses to reset when HEAD commit does not match marker sourceSha (T2-MSKIP-01)', async () => {
+      // Record HEAD before we start - this is the commit that should survive
+      const originalHead = git(local, 'rev-parse', 'HEAD');
+
+      // Create a fake marker with 'am-in-progress' phase that references a
+      // non-existent sourceSha (simulating the case where the user manually
+      // committed something after the original am was interrupted)
+      const fakeSourceSha = '0000000000000000000000000000000000000000';
+      const fakeSubject = 'fake: commit that never existed';
+      setReviewPending({
+        remote: 'upstream',
+        sourceSha: fakeSourceSha,
+        subject: fakeSubject,
+        included: ['packages/cli/a.ts'],
+        review: [],
+        regenerate: [],
+        outside: [],
+        phase: 'am-in-progress',
+      });
+
+      // Create a NEW user commit on top of HEAD - this simulates the user
+      // manually doing work after the original am was interrupted
+      writeFileSync(join(local, 'user-work.txt'), 'user work content\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'user: manual work after am interrupted');
+      const userCommitSha = git(local, 'rev-parse', 'HEAD');
+
+      // Verify: HEAD is now the user commit (not the fakeSourceSha)
+      expect(userCommitSha).not.toBe(originalHead);
+
+      // Call mirror skip - it should REFUSE because HEAD doesn't match the marker
+      const skipCode = await mirrorSkip('upstream');
+
+      // v0.7.0 HIGH-2: skip should detect the mismatch and refuse
+      expect(skipCode).toBe(1);
+
+      // CRITICAL: HEAD should still be the user's commit, not reset
+      const headAfterSkip = git(local, 'rev-parse', 'HEAD');
+      expect(headAfterSkip).toBe(userCommitSha);
+
+      // Verify the user's commit message is still in the log
+      const headSubject = git(local, 'log', '-1', '--format=%s', 'HEAD');
+      expect(headSubject).toBe('user: manual work after am interrupted');
+    });
+
+    /**
+     * T2-MSKIP-02: Verify baseline silently does `git reset --hard HEAD~1`,
+     * dropping user's commit. This test demonstrates the bug - if the marker
+     * sourceSha MATCHES HEAD's parent, the old code would reset and lose the
+     * user's commit. After the fix, this should still fail with an error
+     * because HEAD itself doesn't match.
+     */
+    test('baseline verification: user commit would be lost without safety check (T2-MSKIP-02)', async () => {
+      // First, create a commit that LOOKS like it could be from a mirror operation
+      // (we'll pretend this was the original am-in-progress commit)
+      writeFileSync(join(local, 'mirror-content.txt'), 'original mirror content\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'feat: original mirror commit');
+      const mirrorCommitSha = git(local, 'rev-parse', 'HEAD');
+
+      // Now create a marker that references this commit as the sourceSha
+      setReviewPending({
+        remote: 'upstream',
+        sourceSha: mirrorCommitSha, // marker says this commit was from the mirror
+        subject: 'feat: original mirror commit',
+        included: ['mirror-content.txt'],
+        review: [],
+        regenerate: [],
+        outside: [],
+        phase: 'am-in-progress',
+      });
+
+      // The user then creates ANOTHER commit on top
+      writeFileSync(join(local, 'user-work.txt'), 'user work content\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'user: additional work');
+      const userCommitSha = git(local, 'rev-parse', 'HEAD');
+
+      // Verify we have the user commit on top of the mirror commit
+      const parentSha = git(local, 'rev-parse', 'HEAD~1');
+      expect(parentSha).toBe(mirrorCommitSha);
+
+      // Call mirror skip - with the fix, it should still REFUSE because HEAD
+      // doesn't match the marker's sourceSha (even though HEAD~1 does)
+      const skipCode = await mirrorSkip('upstream');
+
+      // With v0.7.0 HIGH-2 fix: refuse because HEAD itself doesn't match
+      expect(skipCode).toBe(1);
+
+      // Verify: HEAD should still be the user's commit (not reset to mirror commit)
+      const headAfterSkip = git(local, 'rev-parse', 'HEAD');
+      expect(headAfterSkip).toBe(userCommitSha);
     });
   });
 });

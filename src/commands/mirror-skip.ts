@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { amInProgress, commitSubject, git, gitTry, readCurrentPatchSha } from '../lib/git.js';
+import { amInProgress, commitSubject, git, gitTry, readCurrentPatchSha, revParse } from '../lib/git.js';
 import {
   clearMirrorInProgress,
   clearPendingCommit,
@@ -83,6 +83,32 @@ export async function mirrorSkip(remoteArg?: string): Promise<number> {
   // the user is trying to skip the review transition: behave like review-pause
   // skip (reset HEAD~1 to undo the included-subset commit if any was made).
   // This is a weird state; log and do the safest thing.
+  //
+  // v0.7.0 HIGH-2 (see 2026-04-18-audit.md): Before resetting, verify HEAD's
+  // commit matches what the marker recorded. If the user manually committed
+  // something between the original am and invoking the wrapper, we must NOT
+  // silently drop their work. Check both the subject (the marker stores the
+  // expected commit message) and the SHA (in case the subject was altered).
+  const headSha = revParse('HEAD');
+  const headSubject = commitSubject('HEAD');
+  // The marker's subject is from the source commit; HEAD should match either
+  // the expected subject or the sourceSha if the commit was made by our apply.
+  const headMatchesMarker = headSubject === review.subject || headSha === review.sourceSha;
+  if (!headMatchesMarker) {
+    console.error(
+      `[git-auto-remote] Pause says 'am-in-progress' but no git am is running; refusing to reset.`,
+    );
+    console.error(
+      `[git-auto-remote] HEAD commit mismatch: expected '${review.subject.slice(0, 60)}' (or SHA ${review.sourceSha.slice(0, 8)}),`,
+    );
+    console.error(
+      `[git-auto-remote] but found '${headSubject.slice(0, 60)}' (SHA ${headSha?.slice(0, 8) ?? 'unknown'}).`,
+    );
+    console.error(
+      `[git-auto-remote] The user may have manually committed since the original pause. Resolve manually or use 'git reset --hard HEAD~1' if appropriate.`,
+    );
+    return 1;
+  }
   console.error(`[git-auto-remote] Pause says 'am-in-progress' but no git am is running; skipping by reset HEAD~1.`);
   gitTry('clean', '-fd', '--', ...review.review);
   git('reset', '--hard', 'HEAD~1');
