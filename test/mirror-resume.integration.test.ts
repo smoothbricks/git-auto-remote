@@ -1033,8 +1033,10 @@ describe('CRIT-2: postAmTransition HEAD verification', () => {
   function pushAmConflictWithReview(): string {
     // Seed with review path
     writeFileSync(join(local, 'packages/reviewed'), 'reviewed v1\n');
+    // Also modify packages/cli/a.ts locally to cause a conflict
+    writeFileSync(join(local, 'packages/cli/a.ts'), 'v1 LOCAL MODIFIED\n');
     git(local, 'add', '-A');
-    git(local, 'commit', '-q', '-m', 'local: seed reviewed');
+    git(local, 'commit', '-q', '-m', 'local: seed reviewed + modify a.ts');
 
     const seed = join(root, 'seed');
     writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v1\n');
@@ -1045,6 +1047,7 @@ describe('CRIT-2: postAmTransition HEAD verification', () => {
     git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
 
     // Push commit with both conflict-causing change AND review content
+    // This will conflict because local modified a.ts differently
     writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream conflict\n');
     writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v2 upstream\n');
     git(seed, 'add', '-A');
