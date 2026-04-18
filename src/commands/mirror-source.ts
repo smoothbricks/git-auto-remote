@@ -21,6 +21,19 @@ export function mirrorSource(remoteArg: string | undefined, extraArgs: string[] 
     return 1;
   }
 
+  // v0.7.0 MEDIUM-1 (see 2026-04-18-audit.md): Detect garbage sourceSha
+  // (post-GC or upstream force-push dropped the commit) before invoking git show.
+  // This prevents raw "fatal: bad object" errors and gives users actionable guidance.
+  const verify = spawnSync('git', ['rev-parse', '--verify', '--quiet', `${review.sourceSha}^{commit}`], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (verify.status !== 0) {
+    const sha8 = review.sourceSha.slice(0, 8);
+    console.error(`[git-auto-remote] Source commit ${sha8} not in object DB (post-GC or upstream force-push). Re-fetch ${review.remote} or run 'mirror skip' to drop this pause.`);
+    return 1;
+  }
+
   const r = spawnSync('git', ['show', review.sourceSha, ...extraArgs], {
     stdio: 'inherit',
   });
