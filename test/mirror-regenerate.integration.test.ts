@@ -252,7 +252,7 @@ describe('regenerate safety: command must not touch paths outside regeneratePath
     git(local, 'fetch', '-q', 'upstream');
 
     // Command modifies bun.lock (in scope) AND touches a file outside regeneratePaths.
-    setRegenerateCommand("printf 'regenerated\\n' > bun.lock && printf 'leaked\\n' > packages/cli/leaked.ts");
+    setRegenerateCommand("printf 'regenerated\n' > bun.lock && printf 'leaked\n' > packages/cli/leaked.ts");
 
     const code = await mirrorPull({ remote: 'upstream' });
     expect(code).toBe(0); // amend happens for bun.lock, leaked stays dirty.
@@ -263,5 +263,40 @@ describe('regenerate safety: command must not touch paths outside regeneratePath
     expect(existsSync(join(local, 'packages/cli/leaked.ts'))).toBe(true);
     const status = git(local, 'status', '--porcelain');
     expect(status).toContain('packages/cli/leaked.ts');
+  });
+
+  test('follow-up mirror pull after leak exits 1 with dirty tree message (HIGH-7)', async () => {
+    // This test locks in the inline-comment claim at regen.ts:17-19:
+    // "The next `mirror pull` will refuse with dirty-tree, surfacing the config bug."
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2\n');
+    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'pkg: bump A + lock');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    // First pull: command leaks a file outside regeneratePaths.
+    setRegenerateCommand("printf 'regenerated\n' > bun.lock && printf 'leaked\n' > packages/cli/leaked.ts");
+
+    const firstCode = await mirrorPull({ remote: 'upstream' });
+    expect(firstCode).toBe(0);
+    expect(existsSync(join(local, 'packages/cli/leaked.ts'))).toBe(true);
+
+    // Upstream has no new commits, but the leaked file makes the tree dirty.
+    // Second pull should refuse with dirty-tree message.
+    let stderrCaptured = '';
+    const originalStderr = console.error;
+    console.error = (...args: unknown[]) => {
+      stderrCaptured += args.join(' ') + '\n';
+    };
+
+    const secondCode = await mirrorPull({ remote: 'upstream' });
+
+    console.error = originalStderr;
+
+    expect(secondCode).toBe(1);
+    expect(stderrCaptured).toContain('Working tree is dirty');
+    expect(stderrCaptured).toContain('upstream');
   });
 });
