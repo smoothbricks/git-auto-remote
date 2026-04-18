@@ -448,4 +448,91 @@ describe('mirror diff integration - v0.5.7 review-only invariant', () => {
     const code = mirrorDiff('upstream');
     expect(code).toBe(0);
   });
+
+  /**
+   * T2-MDIFF-01: garbage-sourceSha detection (MEDIUM-1 part 1)
+   * When sourceSha is missing from object DB (post-GC or force-push),
+   * mirror diff should emit a tool-authored error rather than raw
+   * `fatal: bad object` from git.
+   */
+  test('mirror diff emits tool-authored error when sourceSha is missing from object DB', () => {
+    // Synthesize a marker pointing at a SHA that doesn't exist in the object DB.
+    // This simulates post-GC or force-push scenarios where the commit is dropped.
+    const garbageSha = 'deadbeef' + '0'.repeat(32); // 40-char hex SHA that doesn't exist
+
+    setReviewPending({
+      remote: 'upstream',
+      sourceSha: garbageSha,
+      subject: 'Some commit that got GC-ed',
+      included: ['packages/cli/a.ts'],
+      review: ['tooling/workspace.gitconfig'],
+      regenerate: [],
+      outside: [],
+      phase: 'review-pause',
+    });
+
+    // Capture stderr to verify tool-authored error (not raw git error).
+    const originalError = console.error;
+    let captured = '';
+    console.error = (...args: unknown[]): void => {
+      captured += args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n';
+    };
+    let code: number;
+    try {
+      code = mirrorDiff(undefined);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(code).toBe(1);
+    // Must emit tool-authored error, NOT raw `fatal: bad object` from git.
+    expect(captured).toContain('[git-auto-remote]');
+    expect(captured).toContain('not in object DB');
+    expect(captured).toContain('post-GC or upstream force-push');
+    expect(captured).toContain(garbageSha.slice(0, 8));
+    // Must NOT contain raw git error.
+    expect(captured).not.toContain('fatal: bad object');
+  });
+});
+
+// T2-MSRC-01: garbage-sourceSha detection for mirror source
+// MEDIUM-1 (see 2026-04-18-audit.md): mirror source should detect garbage sourceSha
+describe('mirror source garbage-sourceSha detection (MEDIUM-1)', () => {
+  test('mirror source emits tool-authored error when sourceSha is missing from object DB', () => {
+    // Synthesize a marker pointing at a SHA that doesn't exist in the object DB.
+    // This simulates post-GC or force-push scenarios where the commit is gone.
+    const garbageSha = '1234567890abcdef1234567890abcdef12345678';
+
+    setReviewPending({
+      remote: 'upstream',
+      sourceSha: garbageSha,
+      subject: 'Some commit that was GCed',
+      included: [],
+      review: ['packages/cli/a.ts'],
+      regenerate: [],
+      outside: [],
+      phase: 'review-pause',
+    });
+
+    // Capture stderr to verify tool-authored error, not raw git error
+    const originalStderr = console.error;
+    let capturedStderr = '';
+    console.error = (...args: unknown[]): void => {
+      capturedStderr += args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n';
+    };
+
+    let code: number;
+    try {
+      code = mirrorSource(undefined);
+    } finally {
+      console.error = originalStderr;
+    }
+
+    expect(code).toBe(1);
+    // Must emit the tool-authored error message, not raw git "fatal: bad object"
+    expect(capturedStderr).toContain('[git-auto-remote] Source commit 12345678 not in object DB');
+    expect(capturedStderr).toContain('post-GC or upstream force-push');
+    expect(capturedStderr).toContain("Re-fetch upstream or run 'mirror skip' to drop this pause");
+    expect(capturedStderr).not.toContain('fatal: bad object');
+  });
 });

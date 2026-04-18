@@ -2,6 +2,17 @@ import { spawnSync } from 'node:child_process';
 import { getReviewPending, type ReviewPendingState } from '../lib/mirror-state.js';
 
 /**
+ * Verify that a SHA exists in the object database.
+ * Returns true if the SHA resolves to a valid commit.
+ */
+function shaExistsInObjectDb(sha: string): boolean {
+  const r = spawnSync('git', ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], {
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+  return r.status === 0;
+}
+
+/**
  * Show what the SOURCE COMMIT of the current partial pause changed in the
  * REVIEW bucket - i.e. the drift the user needs to audit and decide about.
  * Runs `git diff HEAD <sourceSha>` scoped to exactly the review paths
@@ -59,6 +70,17 @@ export function mirrorDiff(remoteArg: string | undefined, extraArgs: string[] = 
   }
   if (remoteArg && remoteArg !== review.remote) {
     console.error(`[git-auto-remote] Pending review is for '${review.remote}', not '${remoteArg}'.`);
+    return 1;
+  }
+
+  // v0.7.0 MEDIUM-1 (see 2026-04-18-audit.md): Verify sourceSha exists in object DB
+  // before invoking git diff. Post-GC or upstream force-push can drop the commit,
+  // producing cryptic "fatal: bad object" errors. Emit a tool-authored message.
+  if (!shaExistsInObjectDb(review.sourceSha)) {
+    const sha8 = review.sourceSha.slice(0, 8);
+    console.error(
+      `[git-auto-remote] Source commit ${sha8} not in object DB (post-GC or upstream force-push). Re-fetch ${review.remote} or run 'mirror skip' to drop this pause.`
+    );
     return 1;
   }
 
