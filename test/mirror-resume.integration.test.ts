@@ -775,3 +775,383 @@ describe('v0.5.5: review-pause footer Dropped-hint produces meaningful diff', ()
     expect(diffOut).toContain('outside content');
   });
 });
+
+/**
+ * CRIT-1 (T2-MCONT-02 through T2-MCONT-09): Perturbation hardening for
+ * `mirror continue`. All four continue paths must explicitly re-assert the
+ * tracking ref to sourceSha before tail-calling mirrorPull, mirroring the
+ * v0.6.3 skip fix. This protects against:
+ *   - Manual `git update-ref -d` deleting the tracking ref
+ *   - Misconfigured fetch refspec clobbering the ref
+ *   - Parallel processes / direnv reload rewinding tracking
+ */
+describe('CRIT-1: perturbation hardening - tracking ref re-assertion', () => {
+  /** Seed packages/reviewed on both sides at v1, then push a mixed partial. */
+  function pushMixedPartial(): string {
+    writeFileSync(join(local, 'packages/reviewed'), 'reviewed v1\n');
+    git(local, 'add', '-A');
+    git(local, 'commit', '-q', '-m', 'local: seed reviewed');
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v1\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'upstream: seed reviewed');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream\n');
+    writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v2\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'feat: bump A + reviewed');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    return git(seed, 'rev-parse', 'HEAD');
+  }
+
+  beforeEach(() => {
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/reviewed');
+  });
+
+  describe('T2-MCONT-02/03: continueReviewPause re-asserts tracking ref when deleted', () => {
+    test('tracking ref is restored to sourceSha after deletion', async () => {
+      const sourceSha = pushMixedPartial();
+      await mirrorPull({ remote: 'upstream' });
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+
+      // User stages review content
+      git(local, 'add', 'packages/reviewed');
+
+      // Perturbation: delete tracking ref between pause and continue
+      git(local, 'update-ref', '-d', TRACKING);
+      expect(() => git(local, 'rev-parse', TRACKING)).toThrow();
+
+      // Continue should re-assert tracking before tail-calling mirrorPull
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // Tracking ref must be at sourceSha, not missing
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+    });
+
+    test('no duplicate commits when tracking rewound to older SHA', async () => {
+      const sourceSha = pushMixedPartial();
+      await mirrorPull({ remote: 'upstream' });
+
+      // User stages and continues
+      git(local, 'add', 'packages/reviewed');
+
+      // Perturbation: rewind tracking to parent of sourceSha
+      const olderSha = git(local, 'rev-parse', `${sourceSha}^`);
+      git(local, 'update-ref', TRACKING, olderSha);
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // The continued commit should appear only once in log
+      const subjects = git(local, 'log', '--format=%s', '-10').split('\n');
+      const featCount = subjects.filter(s => s.includes('feat: bump A + reviewed')).length;
+      expect(featCount).toBe(1);
+
+      // Tracking must be at sourceSha
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+    });
+  });
+
+  describe('T2-MCONT-04/05: continuePureReviewPause re-asserts tracking ref when deleted', () => {
+    function pushPureReviewCommit(): string {
+      writeFileSync(join(local, 'bun.lock'), 'locked v1\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'local: seed bun.lock');
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'bun.lock'), 'locked v1\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'upstream: seed bun.lock');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+
+      writeFileSync(join(seed, 'bun.lock'), 'locked v2\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'chore: bump bun.lock');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      return git(seed, 'rev-parse', 'HEAD');
+    }
+
+    beforeEach(() => {
+      git(local, 'config', 'auto-remote.upstream.reviewPaths', 'bun.lock');
+    });
+
+    test('tracking ref is restored to sourceSha after deletion', async () => {
+      const sourceSha = pushPureReviewCommit();
+      await mirrorPull({ remote: 'upstream' });
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+
+      // User stages content
+      git(local, 'add', 'bun.lock');
+
+      // Perturbation: delete tracking ref
+      git(local, 'update-ref', '-d', TRACKING);
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // Tracking must be at sourceSha
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+    });
+
+    test('no duplicate commits when tracking rewound to older SHA', async () => {
+      const sourceSha = pushPureReviewCommit();
+      await mirrorPull({ remote: 'upstream' });
+
+      git(local, 'add', 'bun.lock');
+
+      // Perturbation: rewind tracking
+      const olderSha = git(local, 'rev-parse', `${sourceSha}^`);
+      git(local, 'update-ref', TRACKING, olderSha);
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // The chore commit should appear only once
+      const subjects = git(local, 'log', '--format=%s', '-10').split('\n');
+      const choreCount = subjects.filter(s => s.includes('chore: bump bun.lock')).length;
+      expect(choreCount).toBe(1);
+
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+    });
+  });
+
+  describe('T2-MCONT-06/07: continueAm re-asserts tracking ref after am --continue', () => {
+    function pushUpstreamConflict(message = 'pkg: bump A to v2'): string {
+      writeFileSync(join(local, 'packages/cli/a.ts'), 'v1 local (different)\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'local: diverge A');
+
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', message);
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      return git(seed, 'rev-parse', 'HEAD');
+    }
+
+    test('tracking ref is restored to sourceSha after deletion during am conflict', async () => {
+      const conflictSha = pushUpstreamConflict();
+
+      await mirrorPull({ remote: 'upstream' });
+      expect(existsSync(join(local, '.git/rebase-apply'))).toBe(true);
+
+      // User resolves conflict
+      writeFileSync(join(local, 'packages/cli/a.ts'), 'v2 upstream\n');
+      git(local, 'add', 'packages/cli/a.ts');
+
+      // Perturbation: delete tracking ref while am is still in progress
+      git(local, 'update-ref', '-d', TRACKING);
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // am should be done
+      expect(existsSync(join(local, '.git/rebase-apply'))).toBe(false);
+
+      // Tracking must be at conflictSha
+      expect(git(local, 'rev-parse', TRACKING)).toBe(conflictSha);
+    });
+
+    test('no duplicate commits when tracking rewound during am conflict', async () => {
+      const conflictSha = pushUpstreamConflict('feat: critical upstream update');
+
+      await mirrorPull({ remote: 'upstream' });
+
+      // User resolves
+      writeFileSync(join(local, 'packages/cli/a.ts'), 'v2 upstream\n');
+      git(local, 'add', 'packages/cli/a.ts');
+
+      // Perturbation: rewind tracking
+      const olderSha = git(local, 'rev-parse', `${conflictSha}^`);
+      git(local, 'update-ref', TRACKING, olderSha);
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // The commit should appear only once
+      const subjects = git(local, 'log', '--format=%s', '-10').split('\n');
+      const count = subjects.filter(s => s.includes('feat: critical upstream update')).length;
+      expect(count).toBe(1);
+
+      expect(git(local, 'rev-parse', TRACKING)).toBe(conflictSha);
+    });
+  });
+
+  describe('T2-MCONT-08/09: continue is immune to fetch-refspec clobber on auto-resume', () => {
+    test('tracking ref stays at source SHA despite misconfigured +refs/.../mirror/* refspec', async () => {
+      const sourceSha = pushMixedPartial();
+
+      // Pause on review
+      await mirrorPull({ remote: 'upstream' });
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+
+      // Install the misconfigured fetch refspec
+      const olderSha = git(local, 'rev-parse', `${sourceSha}^`);
+      git(upstream, 'update-ref', TRACKING, olderSha);
+      git(
+        local,
+        'config',
+        '--add',
+        'remote.upstream.fetch',
+        '+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*',
+      );
+
+      // Stage review and continue
+      git(local, 'add', 'packages/reviewed');
+
+      // The continue's tail-call to mirrorPull must NOT clobber tracking
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // Assertion 1: tracking ends at sourceSha, NOT olderSha
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+
+      // Assertion 2: no duplicate of the continued commit
+      const subjects = git(local, 'log', '--format=%s', '-10').split('\n');
+      const featCount = subjects.filter(s => s.includes('feat: bump A + reviewed')).length;
+      expect(featCount).toBe(1);
+    });
+  });
+});
+
+/**
+ * CRIT-2 (T2-MCONT-10 through T2-MCONT-12): HEAD verification in postAmTransition.
+ * When transitioning from am-in-progress to review-pause, the tool must verify
+ * that HEAD actually contains the included subset of sourceSha before overlaying
+ * review content. If HEAD is wrong (e.g., user ran `git am --abort`), the tool
+ * must refuse rather than silently creating a review-pause on inconsistent state.
+ */
+describe('CRIT-2: postAmTransition HEAD verification', () => {
+  function pushAmConflictWithReview(): string {
+    // Seed with review path
+    writeFileSync(join(local, 'packages/reviewed'), 'reviewed v1\n');
+    git(local, 'add', '-A');
+    git(local, 'commit', '-q', '-m', 'local: seed reviewed');
+
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v1\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'upstream: seed reviewed');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+
+    // Push commit with both conflict-causing change AND review content
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream conflict\n');
+    writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v2 upstream\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'feat: conflicting change + review');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    return git(seed, 'rev-parse', 'HEAD');
+  }
+
+  beforeEach(() => {
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/reviewed');
+  });
+
+  test('T2-MCONT-10/11: postAmTransition refuses when HEAD does not contain included subset', async () => {
+    const sourceSha = pushAmConflictWithReview();
+
+    // Start mirror pull - should pause on am conflict
+    await mirrorPull({ remote: 'upstream' });
+    expect(existsSync(join(local, '.git/rebase-apply'))).toBe(true);
+
+    // Get the HEAD before we abort
+    const headBeforeAbort = git(local, 'rev-parse', 'HEAD');
+
+    // User bypasses mirror continue and aborts the am directly
+    git(local, 'am', '--abort');
+    expect(existsSync(join(local, '.git/rebase-apply'))).toBe(false);
+
+    // HEAD should be back to before the am attempt
+    const headAfterAbort = git(local, 'rev-parse', 'HEAD');
+    expect(headAfterAbort).toBe(headBeforeAbort);
+
+    // The review-pending marker still says am-in-progress
+    const marker = JSON.parse(readFileSync(join(local, '.git/git-auto-remote/review-pending'), 'utf8'));
+    expect(marker.phase).toBe('am-in-progress');
+    expect(marker.sourceSha).toBe(sourceSha);
+
+    // Now user runs mirror continue - it should detect HEAD doesn't have the included subset
+    // and refuse (not silently transition to review-pause)
+    const code = await mirrorContinue('upstream');
+    expect(code).toBe(1);
+
+    // Should NOT have transitioned to review-pause
+    const markerAfter = JSON.parse(readFileSync(join(local, '.git/git-auto-remote/review-pending'), 'utf8'));
+    expect(markerAfter.phase).toBe('am-in-progress');
+
+    // HEAD should still be at the abort point
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(headAfterAbort);
+  });
+});
+
+/**
+ * HIGH-5 (T2-STR-01): Strengthen existing test to verify no spurious output.
+ */
+describe('HIGH-5: strengthened diagnostics for continue without staging', () => {
+  function pushMixedPartial(): string {
+    writeFileSync(join(local, 'packages/reviewed'), 'reviewed v1\n');
+    git(local, 'add', '-A');
+    git(local, 'commit', '-q', '-m', 'local: seed reviewed');
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v1\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'upstream: seed reviewed');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream\n');
+    writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v2\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'feat: bump A + reviewed');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    return git(seed, 'rev-parse', 'HEAD');
+  }
+
+  beforeEach(() => {
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/reviewed');
+  });
+
+  test('continue WITHOUT staging discards unstaged review leftovers and emits no Applying/Partial lines', async () => {
+    await pushMixedPartial();
+    await mirrorPull({ remote: 'upstream' });
+
+    const headSha = git(local, 'rev-parse', 'HEAD');
+
+    // Capture stderr during continue
+    const originalStderr = process.stderr.write;
+    const stderrChunks: string[] = [];
+    process.stderr.write = (chunk: string | Buffer) => {
+      stderrChunks.push(String(chunk));
+      return true;
+    };
+
+    const code = await mirrorContinue('upstream');
+
+    // Restore stderr
+    process.stderr.write = originalStderr;
+
+    expect(code).toBe(0);
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(headSha);
+    expect(readFileSync(join(local, 'packages/reviewed'), 'utf8')).toBe('reviewed v1\n');
+    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+
+    // Assert no "Applying:" or "Partial:" lines in stderr (these indicate
+    // spurious mirrorPull activity on the just-continued commit)
+    const stderr = stderrChunks.join('');
+    expect(stderr).not.toContain('Applying:');
+    expect(stderr).not.toContain('Partial:');
+  });
+});
