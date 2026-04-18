@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { git, gitTry } from './git.js';
 
 /**
@@ -120,13 +120,15 @@ function readPathList(remote: string, key: string): string[] {
  * Strips `#` comments and blank lines. Throws if the file is missing - a misconfigured
  * `*File` key is a bug we want to surface loudly.
  */
-function readPathsFile(relativePath: string): string[] {
+function readPathsFile(filePath: string): string[] {
   const root = git('rev-parse', '--show-toplevel');
-  const full = join(root, relativePath);
+  // v0.7.0 MEDIUM-3 (see 2026-04-18-audit.md): Support absolute paths directly
+  const full = isAbsolute(filePath) ? filePath : join(root, filePath);
   const content = readFileSync(full, 'utf8');
   const out: string[] = [];
   for (const rawLine of content.split('\n')) {
-    const line = rawLine.replace(/#.*$/, '').trim();
+    // v0.7.0 MEDIUM-3 (see 2026-04-18-audit.md): Strip CRLF line endings before trimming
+    const line = rawLine.replace(/\r$/, '').replace(/#.*$/, '').trim();
     if (line.length > 0) out.push(line);
   }
   return out;

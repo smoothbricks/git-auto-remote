@@ -122,6 +122,70 @@ describe('getMirrorConfig with *File keys', () => {
     gitcfg('auto-remote.public.syncPathsFile', 'nope.txt');
     expect(() => getMirrorConfig('public')).toThrow();
   });
+
+  test('syncPathsFile with CRLF line endings parses correctly (no \\r in path entries)', () => {
+    // v0.7.0 MEDIUM-3 (see 2026-04-18-audit.md): Windows users often have CRLF line endings in config files.
+    // The parser must strip \\r to prevent it from being part of the path.
+    writeFileSync(join(repoDir, 'paths.txt'), 'packages\r\ntooling\r\ndocs\r\n');
+    gitcfg('auto-remote.public.syncPathsFile', 'paths.txt');
+    
+    const config = getMirrorConfig('public');
+    expect(config?.syncPaths).toEqual(['packages', 'tooling', 'docs']);
+    // Verify no \\r is present in any path
+    for (const path of config?.syncPaths ?? []) {
+      expect(path).not.toContain('\r');
+    }
+  });
+
+  test('syncPathsFile that is whitespace-only is treated as no syncPaths', () => {
+    // v0.7.0 MEDIUM-3 (see 2026-04-18-audit.md): A file with only whitespace/comments is equivalent to empty.
+    // getMirrorConfig returns null when syncPaths is empty (no mirror config).
+    writeFileSync(
+      join(repoDir, 'empty-paths.txt'),
+      [
+        '# Only comments',
+        '   ',
+        '\t',
+        '',
+        '  # another comment  ',
+      ].join('\n'),
+    );
+    gitcfg('auto-remote.public.syncPathsFile', 'empty-paths.txt');
+    
+    expect(getMirrorConfig('public')).toBeNull();
+  });
+
+  test('git config --add auto-remote.X.syncPaths multiple values uses last value (documented)', () => {
+    // v0.7.0 MEDIUM-3 (see 2026-04-18-audit.md): git config --add creates multiple values.
+    // Our parser uses --get which returns only the last value - this is intentional behavior.
+    // This test documents that we use the last value and silently drop earlier ones.
+    execFileSync('git', ['config', '--add', 'auto-remote.public.syncPaths', 'first-path'], { cwd: repoDir });
+    execFileSync('git', ['config', '--add', 'auto-remote.public.syncPaths', 'second-path'], { cwd: repoDir });
+    
+    // Verify both values are in git config
+    const allValues = execFileSync('git', ['config', '--get-all', 'auto-remote.public.syncPaths'], { cwd: repoDir }).toString().trim();
+    expect(allValues).toContain('first-path');
+    expect(allValues).toContain('second-path');
+    
+    // But our parser only returns the last value
+    const config = getMirrorConfig('public');
+    expect(config?.syncPaths).toEqual(['second-path']);
+  });
+
+  test('syncPathsFile with absolute path is read from absolute location', () => {
+    // v0.7.0 MEDIUM-3 (see 2026-04-18-audit.md): Absolute paths should be respected and read directly.
+    // join(root, '/etc/evil') gives '/etc/evil' on Unix systems.
+    const externalDir = mkdtempSync(join(tmpdir(), 'gar-external-paths-'));
+    try {
+      writeFileSync(join(externalDir, 'external-paths.txt'), 'external-package\n');
+      gitcfg('auto-remote.public.syncPathsFile', join(externalDir, 'external-paths.txt'));
+      
+      const config = getMirrorConfig('public');
+      expect(config?.syncPaths).toEqual(['external-package']);
+    } finally {
+      rmSync(externalDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('listMirrorConfigs', () => {
