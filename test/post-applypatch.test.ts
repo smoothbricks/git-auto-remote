@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { postApplypatch } from '../src/commands/post-applypatch.js';
-import { trackingRefName } from '../src/lib/mirror-state.js';
+import { getMirrorInProgress, trackingRefName } from '../src/lib/mirror-state.js';
 
 const TRACKING_UPSTREAM = trackingRefName('upstream');
 
@@ -142,5 +142,105 @@ describe('postApplypatch', () => {
 
     // Sentinel gone.
     expect(existsSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'))).toBe(false);
+  });
+
+  // v0.7.0 CRIT-3/MEDIUM-4 validation hardening tests (see 2026-04-18-audit.md)
+  describe('validation failures clear sentinel defensively (CRIT-3)', () => {
+    test('malformed rebase-apply/next emits warning + clears sentinel (T2-PAP-01)', () => {
+      const sha = seedCommit();
+      mkdirSync(join(repoDir, '.git/git-auto-remote'), { recursive: true });
+      writeFileSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'), 'upstream');
+
+      const dir = join(repoDir, '.git', 'rebase-apply');
+      mkdirSync(dir, { recursive: true });
+      // Write malformed "next" file (not a valid number)
+      writeFileSync(join(dir, 'next'), 'abc\n');
+      writeFileSync(join(dir, 'last'), '1\n');
+      const patchNum = String(1).padStart(4, '0');
+      writeFileSync(
+        join(dir, patchNum),
+        `From ${sha} Mon Sep 17 00:00:00 2001\nFrom: t <t@t>\nSubject: [PATCH] x\n\n---\n`,
+      );
+
+      const code = postApplypatch();
+      expect(code).toBe(0);
+      // Sentinel cleared defensively since we can't make progress
+      expect(getMirrorInProgress()).toBeNull();
+    });
+
+    test('missing rebase-apply/last emits warning + clears sentinel (T2-PAP-02)', () => {
+      const sha = seedCommit();
+      mkdirSync(join(repoDir, '.git/git-auto-remote'), { recursive: true });
+      writeFileSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'), 'upstream');
+
+      const dir = join(repoDir, '.git', 'rebase-apply');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'next'), '1\n');
+      // Intentionally NOT writing 'last' file to simulate corruption
+      const patchNum = String(1).padStart(4, '0');
+      writeFileSync(
+        join(dir, patchNum),
+        `From ${sha} Mon Sep 17 00:00:00 2001\nFrom: t <t@t>\nSubject: [PATCH] x\n\n---\n`,
+      );
+
+      const code = postApplypatch();
+      expect(code).toBe(0);
+      // Tracking ref should still be updated (patch was valid)
+      const trackingSha = execFileSync('git', ['rev-parse', TRACKING_UPSTREAM], {
+        cwd: repoDir,
+        encoding: 'utf8',
+      }).trim();
+      expect(trackingSha).toBe(sha);
+      // Sentinel cleared because we can't determine if this is the last patch
+      expect(getMirrorInProgress()).toBeNull();
+    });
+
+    test('patch file first line lacks From <40hex> emits warning (T2-PAP-03)', () => {
+      mkdirSync(join(repoDir, '.git/git-auto-remote'), { recursive: true });
+      writeFileSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'), 'upstream');
+
+      const dir = join(repoDir, '.git', 'rebase-apply');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'next'), '1\n');
+      writeFileSync(join(dir, 'last'), '1\n');
+      // Write patch file WITHOUT proper From header
+      writeFileSync(
+        join(dir, '0001'),
+        'Subject: Bad patch header\nFrom: t <t@t>\n\nThis patch lacks a proper From line\n',
+      );
+
+      const code = postApplypatch();
+      expect(code).toBe(0);
+      // Sentinel cleared defensively since we can't extract SHA to update tracking
+      expect(getMirrorInProgress()).toBeNull();
+    });
+
+    test('next > last (impossible-but-defensive) clears sentinel (T2-PAP-06)', () => {
+      const sha = seedCommit();
+      mkdirSync(join(repoDir, '.git/git-auto-remote'), { recursive: true });
+      writeFileSync(join(repoDir, '.git/git-auto-remote/mirror-in-progress'), 'upstream');
+
+      const dir = join(repoDir, '.git', 'rebase-apply');
+      mkdirSync(dir, { recursive: true });
+      // Impossible state: next > last (shouldn't happen but we handle defensively)
+      writeFileSync(join(dir, 'next'), '5\n');
+      writeFileSync(join(dir, 'last'), '3\n');
+      const patchNum = String(5).padStart(4, '0');
+      writeFileSync(
+        join(dir, patchNum),
+        `From ${sha} Mon Sep 17 00:00:00 2001\nFrom: t <t@t>\nSubject: [PATCH] x\n\n---\n`,
+      );
+
+      const code = postApplypatch();
+      expect(code).toBe(0);
+      // Tracking should still advance
+      const trackingSha = execFileSync('git', ['rev-parse', TRACKING_UPSTREAM], {
+        cwd: repoDir,
+        encoding: 'utf8',
+      }).trim();
+      expect(trackingSha).toBe(sha);
+      // Sentinel cleared because next >= last (defensive >= choice)
+      expect(getMirrorInProgress()).toBeNull();
+    });
   });
 });

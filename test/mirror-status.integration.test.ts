@@ -62,6 +62,27 @@ function captureLog(fn: () => number): { code: number; stdout: string } {
   return { code, stdout: out };
 }
 
+function captureLogAndWarn(fn: () => number): { code: number; stdout: string; stderr: string } {
+  const origLog = console.log;
+  const origWarn = console.warn;
+  let out = '';
+  let warn = '';
+  console.log = (...args: unknown[]) => {
+    out += args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n';
+  };
+  console.warn = (...args: unknown[]) => {
+    warn += args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n';
+  };
+  let code: number;
+  try {
+    code = fn();
+  } finally {
+    console.log = origLog;
+    console.warn = origWarn;
+  }
+  return { code, stdout: out, stderr: warn };
+}
+
 beforeEach(() => {
   originalCwd = process.cwd();
   root = mkdtempSync(join(tmpdir(), 'gar-mirror-status-'));
@@ -208,5 +229,32 @@ describe('mirror status --remotes (v0.6.2)', () => {
     expect(code).toBe(0);
     expect(stdout).toContain('refs on remote');
     expect(stdout).toContain('ls-remote failed');
+  });
+});
+
+describe('mirror status legacy refspec warning (HIGH-3)', () => {
+  test('warns when remote.<X>.fetch contains the legacy +refs/git-auto-remote/mirror/* refspec', () => {
+    // T2-MSTAT-01: Configure the bad refspec on the test remote.
+    git(local, 'config', '--add', 'remote.upstream.fetch', '+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*');
+
+    // Run mirror status and capture stderr for warning
+    const { code, stderr } = captureLogAndWarn(() => mirrorStatus('upstream'));
+
+    expect(code).toBe(0);
+    // The warning should appear in stderr (console.warn)
+    expect(stderr).toContain("[git-auto-remote] WARNING: remote.upstream.fetch contains '+refs/git-auto-remote/mirror/*:...'");
+    expect(stderr).toContain('This was auto-added by pre-v0.6.1 of this tool');
+    expect(stderr).toContain("git config --unset remote.upstream.fetch '^\\+refs/git-auto-remote/mirror'");
+  });
+
+  test('emits no warning when refspec is absent', () => {
+    // T2-MSTAT-02: Ensure no bad refspec is configured (default state from beforeEach)
+    // Run mirror status and capture stderr
+    const { code, stderr } = captureLogAndWarn(() => mirrorStatus('upstream'));
+
+    expect(code).toBe(0);
+    // No warning should appear
+    expect(stderr).not.toContain('[git-auto-remote] WARNING');
+    expect(stderr).not.toContain('git-auto-remote/mirror');
   });
 });
