@@ -2,11 +2,11 @@ import { spawnSync } from 'node:child_process';
 import { applyReviewToWorktree } from '../lib/apply.js';
 import {
   amInProgress,
-  git,
   gitTry,
   hasStagedChanges,
   hasUnresolvedMergeConflicts,
   readCommitMeta,
+  readCurrentPatchSha,
   workingTreeDirty,
 } from '../lib/git.js';
 import { getMirrorConfig } from '../lib/mirror-config.js';
@@ -117,6 +117,11 @@ async function continueAm(remoteArg?: string): Promise<number> {
     return 1;
   }
 
+  // v0.7.0 CRIT-1: Read the source SHA BEFORE continuing, so we can update
+  // tracking correctly even if there's no review-pending marker. The rebase-apply
+  // directory is cleaned up after the last patch completes.
+  const currentPatchSha = readCurrentPatchSha();
+
   // `git am --continue` fires post-applypatch which advances the tracking ref.
   const r = spawnSync('git', ['am', '--continue'], { stdio: 'inherit' });
   if ((r.status ?? 0) !== 0) {
@@ -149,8 +154,9 @@ async function continueAm(remoteArg?: string): Promise<number> {
   // v0.7.0 CRIT-1 (see 2026-04-18-audit.md): tail-call to mirrorPull must
   // re-assert tracking. Any external perturbation between pause and continue
   // (manual update-ref, fetch clobber via misconfigured refspec, parallel
-  // process) could have rewound it.
-  updateTrackingRef(remote, review?.sourceSha ?? 'HEAD');
+  // process) could have rewound it. Use the source SHA we read from rebase-apply
+  // before continuing, or the review marker if available.
+  updateTrackingRef(remote, review?.sourceSha ?? currentPatchSha ?? 'HEAD');
   return mirrorPull({ remote });
 }
 
@@ -164,17 +170,14 @@ function headContainsIncludedSubset(sourceSha: string, included: readonly string
     // No included paths means nothing to verify - vacuously true
     return true;
   }
-  // Use git diff-tree to compare HEAD and sourceSha for the included paths.
-  // -s/--no-patch suppresses patch output, we only care about exit code.
+  // Use git diff --quiet to compare HEAD and sourceSha for the included paths.
+  // --quiet makes git exit non-zero if there are differences.
   // Exit code 0 means no difference (HEAD matches sourceSha for these paths).
-  try {
-    const args = ['diff-tree', '-s', '--no-patch', 'HEAD', sourceSha, '--', ...included];
-    git(...args);
-    return true;
-  } catch {
-    // Non-zero exit code means there's a difference
-    return false;
-  }
+  const result = spawnSync('git', ['diff', '--quiet', 'HEAD', sourceSha, '--', ...included], {
+    encoding: 'utf8',
+    stdio: 'pipe',
+  });
+  return result.status === 0;
 }
 
 /**

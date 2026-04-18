@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installHook } from '../src/lib/hooks.js';
@@ -19,7 +19,7 @@ const TRACKING_UPSTREAM = trackingRefName('upstream');
 let root: string;
 let upstream: string;
 let local: string;
-let originalCwd: string;
+
 
 const GIT_ENV = {
   GIT_AUTHOR_NAME: 'Test',
@@ -51,7 +51,6 @@ function commit(cwd: string, path: string, content: string, message: string): st
 }
 
 beforeEach(() => {
-  originalCwd = process.cwd();
   root = mkdtempSync(join(tmpdir(), 'gar-version-skew-'));
   upstream = join(root, 'upstream.git');
   local = join(root, 'local');

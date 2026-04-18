@@ -10,7 +10,6 @@ import { installHook } from '../src/lib/hooks.js';
 import { trackingRefName } from '../src/lib/mirror-state.js';
 
 const TRACKING_REMOTE1 = trackingRefName('remote1');
-const TRACKING_REMOTE2 = trackingRefName('remote2');
 
 /**
  * End-to-end tests for hook entry points (post-checkout, pre-push, post-merge).
