@@ -1069,4 +1069,117 @@ describe('mirror pull with root commits on the mirror', () => {
       expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(newUpstreamHead);
     });
   });
+
+  describe('v0.6.3 regression: misconfigured fetch refspec MUST NOT clobber tracking ref', () => {
+    /**
+     * Defect B: even after v0.6.1 stopped AUTO-ADDING the mirror fetch
+     * refspec, a user (or prior CI scripts, or leftover config from <=0.6.0)
+     * may still have
+     *   +refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*
+     * in `remote.<X>.fetch`. Any subsequent `git fetch <remote>` inherits
+     * that refspec and force-overwrites the local tracking ref with
+     * whatever value lives on the remote. Result: the pull silently
+     * fast-forwards (or rolls BACK!) the tracking ref, skipping in-range
+     * commits the user expected to be applied (or re-applying ones that
+     * were already done).
+     *
+     * v0.6.3 fix: `mirror pull` passes an EXPLICIT narrow refspec to
+     * `git fetch`:
+     *   +refs/heads/<syncBranch>:refs/remotes/<remote>/<syncBranch>
+     * With an explicit refspec argument, git ignores all configured
+     * `remote.<X>.fetch` entries for that invocation - so mirror pull is
+     * immune to whatever the user has configured.
+     *
+     * This test reproduces the clobber scenario:
+     *   - local tracking ref at X+1 (we're ahead)
+     *   - bare upstream's refs/git-auto-remote/mirror/<X>/last-synced at X (older)
+     *   - misconfigured refspec present on local
+     *   - run `mirror pull`
+     *
+     * Pre-fix: local tracking ref ends at X (clobbered back).
+     * Post-fix: local tracking ref stays at X+1.
+     */
+    test('misconfigured mirror fetch refspec does not clobber tracking ref on fetch', async () => {
+      // Seed: upstream at X. Advance upstream by one commit to X+1 (the
+      // "we already processed this" commit); local tracking at X+1.
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A v2 (ahead)\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'pkg: bump A to X+1');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      const xPlus1 = git(local, 'rev-parse', 'upstream/main');
+      const x = git(local, 'rev-parse', 'upstream/main^');
+
+      // Apply X+1 to local (so tracking genuinely ends at X+1 via a real pull).
+      const prePullCode = await mirrorPull({ remote: 'upstream' });
+      expect(prePullCode).toBe(0);
+      expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(xPlus1);
+
+      // Now make the mirror advance further with a NEW in-scope commit X+2,
+      // so there's a real range for the tested pull to process (otherwise
+      // the pull exits early on "up-to-date" before even considering the
+      // range logic - we want to see the range correctly start at X+1+1).
+      writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A v3\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'pkg: bump A to X+2');
+      git(seed, 'push', '-q', 'origin', 'main');
+      // Intentionally do NOT `git fetch` here - we want the tested pull's
+      // own fetch to be the one that might get clobbered.
+
+      // Simulate the misconfig scenario:
+      //   - bare upstream has the mirror tracking ref at X (older than local's X+1)
+      //   - local has the bad +refs/git-auto-remote/mirror/*:... refspec
+      git(upstream, 'update-ref', TRACKING_UPSTREAM, x);
+      git(
+        local,
+        'config',
+        '--add',
+        'remote.upstream.fetch',
+        '+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*',
+      );
+
+      // Run the pull. Its fetch must use the explicit narrow refspec and
+      // ignore the misconfigured one, so local tracking stays at X+1 (not
+      // rolled back to X). Capture stderr so we can observe which commits
+      // were actually processed - the most direct evidence of range logic.
+      const originalError = console.error;
+      let captured = '';
+      console.error = (...args: unknown[]): void => {
+        captured += args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n';
+      };
+      let code: number;
+      try {
+        code = await mirrorPull({ remote: 'upstream' });
+      } finally {
+        console.error = originalError;
+      }
+      expect(code).toBe(0);
+
+      // Assertion 1: the pull processed ONLY X+2 (range started from X+1).
+      // Pre-fix: fetch clobbered tracking to X, so the range was X..X+2 and
+      // the pull ALSO re-processed X+1 (would print "Applying: <sha>  pkg:
+      // bump A to X+1"). Post-fix: range is X+1..X+2, only X+2 applied.
+      expect(captured).toContain('pkg: bump A to X+2');
+      expect(captured).not.toContain('pkg: bump A to X+1');
+
+      // Assertion 2: local tracking ref ends at X+2 (newest upstream tip).
+      // This holds both pre-fix (eventually re-advances via processing) and
+      // post-fix (never regressed), but we still assert it's not X.
+      const trackingAfter = git(local, 'rev-parse', TRACKING_UPSTREAM);
+      expect(trackingAfter).not.toBe(x); // NOT clobbered to X and left there
+      const xPlus2 = git(local, 'rev-parse', 'upstream/main');
+      expect(trackingAfter).toBe(xPlus2);
+
+      // Assertion 3: bad fetch refspec is still there (we don't touch user
+      // config); it's just ignored by this pull's fetch.
+      const fetchRefspecs = execFileSync('git', ['-C', local, 'config', '--get-all', 'remote.upstream.fetch'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+        .trim()
+        .split('\n');
+      expect(fetchRefspecs).toContain('+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*');
+    });
+  });
 });

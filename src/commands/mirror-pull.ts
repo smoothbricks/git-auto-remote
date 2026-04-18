@@ -122,8 +122,19 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   // expressed via PUSH refspec (callers configure
   // `remote.<X>.push = refs/git-auto-remote/mirror/*:...`), not fetch.
   // See test/mirror-pull.integration.test.ts -> 'v0.6.1 regression'.
+  //
+  // v0.6.3: pass an EXPLICIT narrow refspec to `git fetch`. Even after
+  // v0.6.1 stopped auto-adding the bad mirror refspec, leftover config
+  // from pre-v0.6.1 clones OR CI scripts that re-add it can still clobber
+  // our tracking ref on every fetch. Passing an explicit refspec causes
+  // git to ignore ALL configured `remote.<X>.fetch` entries for this
+  // invocation, so mirror pull is immune to whatever the user has
+  // configured. We only need the syncBranch for our own range computation;
+  // updating other refs/remotes/<remote>/* is the user's concern (they can
+  // still run a plain `git fetch <remote>` for that).
+  // See test/mirror-pull.integration.test.ts -> 'v0.6.3 regression'.
   try {
-    fetchRemote(mirror.remote);
+    fetchRemote(mirror.remote, `+refs/heads/${mirror.syncBranch}:refs/remotes/${mirror.remote}/${mirror.syncBranch}`);
   } catch (e) {
     console.error(`[mirror ${mirror.remote}] fetch failed: ${(e as Error).message}`);
     return 1;
