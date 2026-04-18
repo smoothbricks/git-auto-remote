@@ -1,7 +1,8 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { rewriteCommitterToAuthor } from './commit-rewrite.js';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { amInProgress, commitSubject, gitTry, hasUnresolvedMergeConflicts } from './git.js';
+import { amInProgress, commitSubject, gitTry, hasUnresolvedMergeConflicts, revParse } from './git.js';
 import type { ClassifiedCommit } from './classify.js';
 
 /**
@@ -67,12 +68,32 @@ export function applyRange(
   // All patches empty (pathspec matched nothing) -> nothing to do.
   if (patchBuf.length === 0) return 'applied';
 
+  // Capture HEAD before git am so we can rewrite just the new commits'
+  // committer identities afterwards (v0.6.0 invariant: committer = author
+  // across all commits this tool creates).
+  const headBefore = revParse('HEAD');
+
   const amResult = spawnSync('git', ['am', '--empty=drop', '--3way'], {
     input: patchBuf,
     stdio: ['pipe', 'inherit', 'inherit'],
   });
 
-  if (amResult.status === 0) return 'applied';
+  if (amResult.status === 0) {
+    // git am preserved each commit's author from the patch header, but set
+    // committer to the current git user. Rewrite committer = author for
+    // every commit in the range we just applied. Tracking ref stores
+    // SOURCE SHAs (not our local SHAs) via the post-applypatch hook, so
+    // rewriting local SHAs here does not invalidate the mirror state.
+    if (headBefore) {
+      try {
+        rewriteCommitterToAuthor(headBefore, 'HEAD');
+      } catch (e) {
+        console.error(`[git-auto-remote] committer rewrite failed after git am: ${(e as Error).message}`);
+        return 'error';
+      }
+    }
+    return 'applied';
+  }
   if (amInProgress()) return 'conflict';
   return 'error';
 }
