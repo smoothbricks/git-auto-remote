@@ -299,7 +299,7 @@ describe('mirror pull', () => {
       expect(captured).not.toContain('Continue: git-auto-remote mirror continue');
     });
 
-    test('handler is NOT invoked when review is empty (even if configured)', async () => {
+    test('handler is NOT invoked when review is empty (even if configured, sub-case B)', async () => {
       // Handler creates a side-effect file if invoked. Assert it was NOT created.
       const handlerScript = join(root, 'handler-must-not-fire.sh');
       const sideEffect = join(root, 'handler-fired.marker');
@@ -317,6 +317,356 @@ describe('mirror pull', () => {
       expect(existsSync(sideEffect)).toBe(false);
       // And the commit still auto-applies.
       expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+    });
+  });
+
+  describe('pure-non-sync partial with regenerate (Conloca 0c18e179 shape, sub-case C empty-review)', () => {
+    /**
+     * v0.5.9 INVARIANT: if a source commit touches a regenerate path, the
+     * regenerate command MUST run, regardless of whether the commit has
+     * included or review content.
+     *
+     * The Conloca bug report (v0.5.7/v0.5.8):
+     *
+     *   [mirror private] Partial:  0c18e179  chore(deps): update vite to 7.3.1
+     *     Regenerate (auto-produced):     bun.lock
+     *     Outside sync scope (dropped):   package.json
+     *   [mirror private]   (regenerate paths touched: run 'devenv shell -c
+     *     'bun install'' after continue if needed)
+     *
+     * The commit only bumps deps (bun.lock + root package.json, neither in
+     * syncPaths). Pre-v0.5.9:
+     *   - paused, demanded user action for nothing
+     *   - did NOT run the regenerate command
+     *   - local bun.lock stayed stale until the NEXT sub-case B commit
+     *     came along and accumulated all drift into its amend
+     *
+     * v0.5.9 behavior:
+     *   - regenerate command runs (no exception to the invariant)
+     *   - regenerated content staged for commit
+     *   - if staged diff non-empty: create a new local commit with source's
+     *     author/email/date/message preserved (same pattern as
+     *     continuePureReviewPause when the user stages review content)
+     *   - if staged diff empty (regen was a no-op): just advance tracking
+     *   - outside paths dropped (never synced)
+     *   - tracking advances past source SHA
+     *   - NO pause marker written, NO handler invocation
+     */
+    beforeEach(() => {
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v0\n');
+      writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"0"}\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'seed: bun.lock + package.json');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      git(local, 'update-ref', TRACKING_UPSTREAM, git(local, 'rev-parse', 'upstream/main'));
+
+      // Local has a bun.lock that doesn't match what regen will produce -
+      // ensures regen creates a diff.
+      writeFileSync(join(local, 'bun.lock'), 'local-old\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'local: seed bun.lock');
+
+      git(local, 'config', 'auto-remote.upstream.regeneratePaths', 'bun.lock');
+      git(local, 'config', 'auto-remote.upstream.regenerateCommand', "printf 'regenerated\\n' > bun.lock");
+
+      // Source commit: ONLY touches regenerate + outside. No packages/ touch.
+      writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v1\n');
+      writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"1","dep":"x"}\n');
+      // Author/date must be preserved on the synthesized commit.
+      spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'pre-commit marker to bump index'], {
+        cwd: seed,
+        stdio: 'ignore',
+      });
+      // Go back and make the real commit with specific author metadata.
+      git(seed, 'reset', '--hard', 'HEAD~1');
+      writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v1\n');
+      writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"1","dep":"x"}\n');
+      git(seed, 'add', '-A');
+      const makeCommit = spawnSync('git', ['commit', '-q', '-m', 'chore(deps): update vite to 7.3.1'], {
+        cwd: seed,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'Upstream Author',
+          GIT_AUTHOR_EMAIL: 'upstream@example.com',
+          GIT_AUTHOR_DATE: '2026-01-22T19:46:46+04:00',
+          GIT_COMMITTER_NAME: 'Test',
+          GIT_COMMITTER_EMAIL: 't@t',
+        },
+      });
+      if (makeCommit.status !== 0) throw new Error('seed commit failed');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+    });
+
+    test('regen runs; synthesizes a commit with source author/email/date/message preserved', async () => {
+      const headBefore = git(local, 'rev-parse', 'HEAD');
+      const sourceSha = git(local, 'rev-parse', 'upstream/main');
+
+      const code = await mirrorPull({ remote: 'upstream' });
+      expect(code).toBe(0);
+
+      const headAfter = git(local, 'rev-parse', 'HEAD');
+      // A new commit was created.
+      expect(headAfter).not.toBe(headBefore);
+      // Source author/email/date are preserved on the synthesized commit.
+      expect(git(local, 'log', '-1', '--format=%an')).toBe('Upstream Author');
+      expect(git(local, 'log', '-1', '--format=%ae')).toBe('upstream@example.com');
+      expect(git(local, 'log', '-1', '--format=%aI')).toBe('2026-01-22T19:46:46+04:00');
+      // Subject preserved verbatim.
+      expect(git(local, 'log', '-1', '--format=%s')).toBe('chore(deps): update vite to 7.3.1');
+      // Commit's bun.lock is the REGENERATED content, NOT upstream's.
+      expect(git(local, 'show', 'HEAD:bun.lock')).toBe('regenerated');
+      // Commit contains ONLY bun.lock (NOT package.json - outside dropped).
+      const files = git(local, 'show', '--name-only', '--format=', 'HEAD').split('\n').filter(Boolean).sort();
+      expect(files).toEqual(['bun.lock']);
+      // Tracking advanced past source SHA.
+      expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(sourceSha);
+      // No pause markers.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(false);
+      // Outside path dropped - root package.json NOT pulled in.
+      expect(existsSync(join(local, 'package.json'))).toBe(false);
+    });
+
+    test('emits a one-line "Partial auto-applied (regenerate only)" note', async () => {
+      const originalError = console.error;
+      let captured = '';
+      console.error = (...args: unknown[]): void => {
+        captured += args.map((a) => (typeof a === 'string' ? a : String(a))).join(' ') + '\n';
+      };
+      try {
+        const code = await mirrorPull({ remote: 'upstream' });
+        expect(code).toBe(0);
+      } finally {
+        console.error = originalError;
+      }
+
+      // Qualifier is "(regenerate only)" because regen produced a commit.
+      expect(captured).toMatch(/Partial auto-applied:\s+[0-9a-f]{8}\s+chore\(deps\).*\(regenerate only\)/);
+      expect(captured).toContain('Regenerated:');
+      expect(captured).toContain('bun.lock');
+      expect(captured).toContain('Outside (dropped):');
+      expect(captured).toContain('package.json');
+
+      // MUST NOT contain the pre-v0.5.9 pause messaging.
+      expect(captured).not.toContain('(regenerate paths touched: run');
+      expect(captured).not.toContain('Continue: git-auto-remote mirror continue');
+      expect(captured).not.toContain('Review (in worktree, unstaged)');
+    });
+
+    test('no-op regen (output matches existing): tracking advances, NO commit created', async () => {
+      // Override regen command to produce content matching local's existing bun.lock.
+      git(local, 'config', 'auto-remote.upstream.regenerateCommand', "printf 'local-old\\n' > bun.lock");
+
+      const headBefore = git(local, 'rev-parse', 'HEAD');
+      const sourceSha = git(local, 'rev-parse', 'upstream/main');
+
+      const code = await mirrorPull({ remote: 'upstream' });
+      expect(code).toBe(0);
+
+      // HEAD unchanged: regen was idempotent.
+      expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+      // Tracking still advances past source (commit is considered processed).
+      expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(sourceSha);
+      // No pause markers.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      // bun.lock unchanged.
+      expect(readFileSync(join(local, 'bun.lock'), 'utf8')).toBe('local-old\n');
+    });
+
+    test('--non-interactive: regen runs and commit is synthesized (does NOT stop with exit 2)', async () => {
+      const code = await mirrorPull({
+        remote: 'upstream',
+        nonInteractive: true,
+      });
+      expect(code).toBe(0);
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      expect(git(local, 'log', '-1', '--format=%s')).toBe('chore(deps): update vite to 7.3.1');
+    });
+
+    test('handler is NOT invoked when review is empty (sub-case C, regen-only)', async () => {
+      const handlerScript = join(root, 'handler-must-not-fire-c.sh');
+      const sideEffect = join(root, 'handler-fired-c.marker');
+      writeFileSync(handlerScript, `#!/usr/bin/env bash\ntouch ${JSON.stringify(sideEffect)}\nexit 0\n`);
+      execFileSync('chmod', ['+x', handlerScript]);
+
+      const code = await mirrorPull({
+        remote: 'upstream',
+        onPartial: handlerScript,
+      });
+      expect(code).toBe(0);
+      expect(existsSync(sideEffect)).toBe(false);
+      // Commit still synthesized (invariant holds regardless of handler).
+      expect(git(local, 'log', '-1', '--format=%s')).toBe('chore(deps): update vite to 7.3.1');
+    });
+
+    test('regen command failure (non-zero exit): HALTS with error, no commit, no tracking advance', async () => {
+      git(local, 'config', 'auto-remote.upstream.regenerateCommand', 'exit 42');
+
+      const headBefore = git(local, 'rev-parse', 'HEAD');
+      const trackingBefore = git(local, 'rev-parse', TRACKING_UPSTREAM);
+
+      const code = await mirrorPull({ remote: 'upstream' });
+      // Error propagation: non-zero exit.
+      expect(code).toBe(1);
+      // HEAD unchanged, tracking unchanged - no silent state corruption.
+      expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+      expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(trackingBefore);
+      // No markers left behind.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(false);
+    });
+  });
+
+  describe('pure-non-sync partial with NO regenerate paths (pure outside-only)', () => {
+    /**
+     * Edge case: commit touches ONLY outside paths (no included, no review,
+     * no regenerate). Nothing for the tool to do. Advance tracking, emit
+     * "(non-sync only, no regenerate)" note.
+     */
+    beforeEach(() => {
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"0"}\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'seed: package.json');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      git(local, 'update-ref', TRACKING_UPSTREAM, git(local, 'rev-parse', 'upstream/main'));
+
+      writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"1"}\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'docs: bump version comment');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+    });
+
+    test('advances tracking without commit, no pause, no handler', async () => {
+      const headBefore = git(local, 'rev-parse', 'HEAD');
+      const sourceSha = git(local, 'rev-parse', 'upstream/main');
+      const code = await mirrorPull({ remote: 'upstream' });
+      expect(code).toBe(0);
+      expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+      expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(sourceSha);
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      expect(existsSync(join(local, 'package.json'))).toBe(false);
+    });
+  });
+
+  describe('sub-case C with review AND regenerate: regen stages at pause entry, review overlays unstaged', () => {
+    /**
+     * Commit touches included=[], review=[x], regenerate=[bun.lock],
+     * outside=[pkg.json]. Pre-v0.5.9: paused with "run regen manually" hint.
+     * v0.5.9: regen runs at pause entry, stages regen content, review
+     * overlays unstaged. `mirror continue` commits the full index (regen +
+     * user-staged review hunks) as ONE commit with source metadata via
+     * existing continuePureReviewPause logic.
+     */
+    beforeEach(() => {
+      // Seed review + regen baselines.
+      const seed = join(root, 'seed');
+      mkdirSync(join(seed, 'tooling'), { recursive: true });
+      writeFileSync(join(seed, 'tooling/reviewed.conf'), 'v0\n');
+      writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v0\n');
+      writeFileSync(join(seed, 'package.json'), '{"name":"up","v":"0"}\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'seed: baselines');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      git(local, 'update-ref', TRACKING_UPSTREAM, git(local, 'rev-parse', 'upstream/main'));
+      mkdirSync(join(local, 'tooling'), { recursive: true });
+      writeFileSync(join(local, 'tooling/reviewed.conf'), 'v0\n');
+      writeFileSync(join(local, 'bun.lock'), 'local-old\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'local: seed baselines');
+
+      git(local, 'config', 'auto-remote.upstream.reviewPaths', 'tooling/reviewed.conf');
+      git(local, 'config', 'auto-remote.upstream.regeneratePaths', 'bun.lock');
+      git(local, 'config', 'auto-remote.upstream.regenerateCommand', "printf 'regenerated\\n' > bun.lock");
+
+      // Source commit: review + regenerate + outside (no included).
+      writeFileSync(join(seed, 'tooling/reviewed.conf'), 'v1\n');
+      writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v1\n');
+      writeFileSync(join(seed, 'package.json'), '{"name":"up","v":"1"}\n');
+      git(seed, 'add', '-A');
+      const r = spawnSync('git', ['commit', '-q', '-m', 'chore(deps): bump vite + tweak review'], {
+        cwd: seed,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'Upstream Author',
+          GIT_AUTHOR_EMAIL: 'upstream@example.com',
+          GIT_AUTHOR_DATE: '2026-02-01T10:00:00+04:00',
+          GIT_COMMITTER_NAME: 'Test',
+          GIT_COMMITTER_EMAIL: 't@t',
+        },
+      });
+      if (r.status !== 0) throw new Error('seed commit failed');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+    });
+
+    test('at pause entry: regen STAGED, review UNSTAGED in worktree, pure-review-pause marker written', async () => {
+      const code = await mirrorPull({ remote: 'upstream' });
+      expect(code).toBe(0);
+
+      // Pause marker present.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
+      expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(true);
+
+      // bun.lock (regen) is STAGED.
+      const stagedNames = git(local, 'diff', '--cached', '--name-only').split('\n').filter(Boolean).sort();
+      expect(stagedNames).toEqual(['bun.lock']);
+      // Staged content is our regenerated output, not upstream's.
+      expect(git(local, 'show', ':bun.lock')).toBe('regenerated');
+
+      // tooling/reviewed.conf (review) is UNSTAGED in worktree.
+      expect(readFileSync(join(local, 'tooling/reviewed.conf'), 'utf8')).toBe('v1\n');
+      const unstagedNames = git(local, 'diff', '--name-only').split('\n').filter(Boolean).sort();
+      expect(unstagedNames).toContain('tooling/reviewed.conf');
+    });
+
+    test('mirror continue with user-staged review: ONE commit lands with source metadata, containing BOTH regen + review', async () => {
+      await mirrorPull({ remote: 'upstream' });
+
+      // User stages the review hunk.
+      git(local, 'add', 'tooling/reviewed.conf');
+
+      const { mirrorContinue } = await import('../src/commands/mirror-continue.js');
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // One new commit at HEAD with source metadata.
+      expect(git(local, 'log', '-1', '--format=%an')).toBe('Upstream Author');
+      expect(git(local, 'log', '-1', '--format=%ae')).toBe('upstream@example.com');
+      expect(git(local, 'log', '-1', '--format=%aI')).toBe('2026-02-01T10:00:00+04:00');
+      expect(git(local, 'log', '-1', '--format=%s')).toBe('chore(deps): bump vite + tweak review');
+
+      // Commit content: BOTH bun.lock (regen) AND tooling/reviewed.conf (review).
+      // NOT package.json (outside).
+      const files = git(local, 'show', '--name-only', '--format=', 'HEAD').split('\n').filter(Boolean).sort();
+      expect(files).toEqual(['bun.lock', 'tooling/reviewed.conf']);
+      expect(git(local, 'show', 'HEAD:bun.lock')).toBe('regenerated');
+      expect(git(local, 'show', 'HEAD:tooling/reviewed.conf')).toBe('v1');
+
+      // Markers cleared.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(false);
+    });
+
+    test('regen command failure at pause entry: HALTS with error, no pause marker stranded', async () => {
+      git(local, 'config', 'auto-remote.upstream.regenerateCommand', 'exit 42');
+
+      const headBefore = git(local, 'rev-parse', 'HEAD');
+      const trackingBefore = git(local, 'rev-parse', TRACKING_UPSTREAM);
+
+      const code = await mirrorPull({ remote: 'upstream' });
+      expect(code).toBe(1);
+      // No state advancement or marker creation.
+      expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+      expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(trackingBefore);
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+      expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(false);
     });
   });
 

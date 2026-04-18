@@ -2,35 +2,92 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { git, hasStagedChanges } from './git.js';
 
 /**
- * Run the configured `regenerateCommand` after a range or partial's apply and
- * amend the resulting changes into HEAD (preserving author + author-date via
- * `--amend --no-edit`).
+ * Outcome of running the configured `regenerateCommand`:
  *
- * Safety contract: the command may produce changes ONLY inside `regeneratePaths`.
- * If it touches anything outside, we do NOT amend those paths - they stay as
- * dirty worktree state and will trip the `mirror pull` dirty-tree precondition
- * on the next iteration, surfacing the config bug to the user.
- *
- * @returns
- *   'ok'                - command succeeded and HEAD was amended (or no changes needed)
- *   'command-failed'    - command exited non-zero; nothing amended
- *   'leaked-out-scope'  - command modified paths outside regeneratePaths; those stay
- *                         dirty in the worktree (config error surfaced upstream)
+ *   'ok'               - command succeeded; regen paths inside scope were
+ *                        processed per the caller's mode (amended into HEAD,
+ *                        or left staged for the caller to commit).
+ *   'command-failed'   - command exited non-zero; nothing amended or staged.
+ *                        Callers MUST propagate this as a hard error (halt
+ *                        the pull, do not advance tracking) - silently
+ *                        skipping causes silent state drift across commits.
+ *   'leaked-out-scope' - command succeeded BUT modified paths OUTSIDE
+ *                        regeneratePaths. Those leaked paths stay unstaged
+ *                        in the worktree; only regen-scope paths were
+ *                        processed. The next `mirror pull` will refuse with
+ *                        dirty-tree, surfacing the config bug. Callers MAY
+ *                        treat this as 'ok' for progress purposes (the
+ *                        staged/amended content is correct) but should be
+ *                        aware the worktree is dirty.
  */
 export type RegenerateOutcome = 'ok' | 'command-failed' | 'leaked-out-scope';
 
+/**
+ * How the caller wants the regenerated in-scope content handled:
+ *
+ *   'amend'      - stage the in-scope changes and `git commit --amend --no-edit`
+ *                  onto HEAD. Used by sub-case B (after git am applied the
+ *                  included subset) and clean-range (amend onto the last
+ *                  commit of the range).
+ *
+ *   'stage-only' - stage the in-scope changes, do NOT commit. Used by
+ *                  sub-case C (no HEAD carrier commit to amend onto). Caller
+ *                  decides what to do with the staged index - either create
+ *                  a synthesized commit with source metadata (empty-review
+ *                  case) or leave it staged under a pure-review-pause so
+ *                  `mirror continue` commits it alongside user-staged review
+ *                  hunks.
+ */
+export type RegenerateMode = 'amend' | 'stage-only';
+
+export type RegenerateResult = {
+  outcome: RegenerateOutcome;
+  /**
+   * True iff at least one path within `regeneratePaths` was modified AND
+   * staged. False when the command was a no-op (regen output already matched
+   * existing state) or when outcome is 'command-failed'. Informs the caller
+   * in 'stage-only' mode whether a commit should be synthesized.
+   */
+  staged: boolean;
+};
+
+/**
+ * Run the configured `regenerateCommand` and handle the resulting changes
+ * per `mode`. Safety contract: the command may produce changes only inside
+ * `regeneratePaths`; paths modified outside that scope are left unstaged
+ * and surfaced via warning (returned as 'leaked-out-scope').
+ *
+ * Two call sites use this:
+ *
+ *   - Clean range / sub-case B (mode='amend'): after `git am` created the
+ *     HEAD commit for the included subset, amend the regen output into
+ *     that commit, preserving its author + author-date via --no-edit.
+ *
+ *   - Sub-case C (mode='stage-only'): no HEAD carrier exists. Stage the
+ *     regen output; caller creates a fresh commit with source metadata
+ *     (empty-review case) or leaves staged content for `mirror continue`
+ *     to pick up alongside review hunks (pure-review-pause case).
+ *
+ * v0.5.9: error propagation. Previously the return value was `RegenerateOutcome`
+ * and all callers ignored it. Now callers MUST check `result.outcome` and
+ * halt on 'command-failed' - silent "continue on failure" caused stale
+ * derived state to compound across commits (the motivation for v0.5.9).
+ */
 export function runRegenerate(
   command: string,
   regeneratePaths: readonly string[],
   remote: string,
-): RegenerateOutcome {
+  mode: RegenerateMode = 'amend',
+): RegenerateResult {
   console.error(`[mirror ${remote}]   regenerating: ${command}`);
-  const r = spawnSync('sh', ['-c', command], { stdio: ['ignore', 'inherit', 'inherit'] });
+  const r = spawnSync('sh', ['-c', command], {
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
   if ((r.status ?? 0) !== 0) {
     console.error(
-      `[mirror ${remote}]   regenerateCommand exited ${r.status}; leaving HEAD as-is (no amend).`,
+      `[mirror ${remote}]   regenerateCommand exited ${r.status}; halting (fix the command and re-run 'mirror pull').`,
     );
-    return 'command-failed';
+    return { outcome: 'command-failed', staged: false };
   }
 
   // What did the command change? Look at the full worktree (tracked + untracked)
@@ -50,13 +107,16 @@ export function runRegenerate(
       `[mirror ${remote}]   regenerateCommand modified paths outside regeneratePaths: ${outside.join(', ')}`,
     );
     console.error(
-      `[mirror ${remote}]     (those changes stay unstaged; only regeneratePaths amended. Fix your command or widen regeneratePaths.)`,
+      `[mirror ${remote}]     (those changes stay unstaged; only regeneratePaths processed. Fix your command or widen regeneratePaths.)`,
     );
   }
 
   if (inside.length === 0) {
-    // Nothing to amend. (Either no change or all changes leaked.)
-    return outside.length === 0 ? 'ok' : 'leaked-out-scope';
+    // Nothing to stage/amend.
+    return {
+      outcome: outside.length === 0 ? 'ok' : 'leaked-out-scope',
+      staged: false,
+    };
   }
 
   // Stage the in-scope changes explicitly by path - don't blanket `git add -A`
@@ -65,17 +125,33 @@ export function runRegenerate(
   if (!hasStagedChanges()) {
     // Staging no-oped (unlikely, but guard). Probably because the paths are
     // untracked + matching gitignore. Surface a message.
-    console.error(`[mirror ${remote}]   regen: nothing to stage after add; skipping amend.`);
-    return outside.length === 0 ? 'ok' : 'leaked-out-scope';
+    console.error(`[mirror ${remote}]   regen: nothing to stage after add; skipping.`);
+    return {
+      outcome: outside.length === 0 ? 'ok' : 'leaked-out-scope',
+      staged: false,
+    };
   }
+
+  if (mode === 'stage-only') {
+    // Caller handles commit creation.
+    return {
+      outcome: outside.length === 0 ? 'ok' : 'leaked-out-scope',
+      staged: true,
+    };
+  }
+
+  // mode === 'amend': amend the staged content into HEAD.
   const amend = spawnSync('git', ['commit', '--amend', '--no-edit'], {
     stdio: ['ignore', 'inherit', 'inherit'],
   });
   if ((amend.status ?? 0) !== 0) {
     console.error(`[mirror ${remote}]   git commit --amend failed after regen.`);
-    return 'command-failed';
+    return { outcome: 'command-failed', staged: true };
   }
-  return outside.length === 0 ? 'ok' : 'leaked-out-scope';
+  return {
+    outcome: outside.length === 0 ? 'ok' : 'leaked-out-scope',
+    staged: true,
+  };
 }
 
 /**

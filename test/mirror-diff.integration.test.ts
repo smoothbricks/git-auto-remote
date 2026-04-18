@@ -7,7 +7,7 @@ import { computeDiffPathspec, mirrorDiff } from '../src/commands/mirror-diff.js'
 import { mirrorPull } from '../src/commands/mirror-pull.js';
 import { mirrorSource } from '../src/commands/mirror-source.js';
 import { installHook } from '../src/lib/hooks.js';
-import { getReviewPending, trackingRefName } from '../src/lib/mirror-state.js';
+import { getReviewPending, setReviewPending, trackingRefName } from '../src/lib/mirror-state.js';
 
 /**
  * Coverage for the `mirror diff` and `mirror source` subcommands plus
@@ -311,67 +311,50 @@ describe('mirror diff integration - v0.5.7 review-only invariant', () => {
    *    privpkgs/vite-plugin-ligma/package.json |   51 +++
    *
    * None of these should appear: bun.lock is regenerate, package.json and
-   * privpkgs/* are outside (narrow syncPaths). The review bucket for that
-   * commit was [] - so the correct output is "No review drift for this
-   * commit." and the stdout MUST NOT contain any of the above file names.
+   * privpkgs/* are outside. The review bucket is [] - correct output is
+   * "No review drift for this commit." and stdout MUST NOT contain any of
+   * the above file names.
+   *
+   * NOTE (v0.5.9+): sub-case B and sub-case C empty-review partials now
+   * auto-apply without writing a review-pending marker, so this state is
+   * no longer reachable through normal `mirrorPull` flow. The test
+   * synthesizes the marker directly via `setReviewPending` to lock in the
+   * DEFENSIVE behavior of `mirrorDiff`: if an empty-review marker somehow
+   * exists (corruption, external tooling, future bug), `mirror diff` must
+   * NOT fall through to `git diff HEAD <sha>` with no pathspec (the
+   * original v0.5.6 bug which diffed everything).
    */
-  test('T3 REGRESSION (Conloca bug): outside + regenerate paths never appear in mirror diff output', async () => {
-    // Seed baselines so upstream commit is a MODIFICATION (not add), matching
-    // the real Conloca case where package.json already existed in the seed.
+  test('T3 REGRESSION (Conloca bug): mirror diff with synthesized empty-review marker prints no-drift message, not everything-diff', () => {
+    // Synthesize a pause marker with review=[] directly. We don't need a
+    // real upstream commit - `mirror diff` only uses the marker's bucket
+    // arrays to decide the pathspec. The sourceSha just has to exist for
+    // potential `git diff HEAD <sha>` fallthrough (which we're asserting
+    // does NOT happen).
     const seed = join(root, 'seed');
-    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v0\n');
-    writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"0"}\n');
-    mkdirSync(join(seed, 'privpkgs/example'), { recursive: true });
-    mkdirSync(join(seed, 'privpkgs/tldraw-app'), { recursive: true });
-    mkdirSync(join(seed, 'privpkgs/vite-plugin-ligma'), { recursive: true });
-    writeFileSync(join(seed, 'privpkgs/example/package.json'), '{"name":"ex","v":"0"}\n');
-    writeFileSync(join(seed, 'privpkgs/tldraw-app/package.json'), '{"name":"td","v":"0"}\n');
-    writeFileSync(join(seed, 'privpkgs/vite-plugin-ligma/package.json'), '{"name":"vpl","v":"0"}\n');
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2\n');
     git(seed, 'add', '-A');
-    git(seed, 'commit', '-q', '-m', 'upstream: seed outside+regenerate baselines');
+    git(seed, 'commit', '-q', '-m', 'any source commit');
     git(seed, 'push', '-q', 'origin', 'main');
     git(local, 'fetch', '-q', 'upstream');
-    git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+    const sourceSha = git(local, 'rev-parse', 'upstream/main');
 
-    // Local: seed the regenerate baseline with DIFFERENT content (simulates
-    // `bun install` having produced our own bun.lock).
-    writeFileSync(join(local, 'bun.lock'), 'local-regenerated-lock\n');
-    git(local, 'add', '-A');
-    git(local, 'commit', '-q', '-m', 'local: seed regenerate baseline');
+    setReviewPending({
+      remote: 'upstream',
+      sourceSha,
+      subject: 'Update dependencies and improve type safety',
+      included: [],
+      review: [], // THE defensive case: empty review
+      regenerate: ['bun.lock'],
+      outside: [
+        'package.json',
+        'privpkgs/example/package.json',
+        'privpkgs/tldraw-app/package.json',
+        'privpkgs/vite-plugin-ligma/package.json',
+      ],
+      phase: 'review-pause',
+    });
 
-    // Source commit: touches ONLY regenerate + outside paths (no review,
-    // no included in syncPaths). This is the Conloca `39766fc2` shape.
-    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v1 HUGE CHANGE\n'.repeat(100));
-    writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"1.0.0","dep":"x"}\n');
-    writeFileSync(join(seed, 'privpkgs/example/package.json'), '{"name":"ex","v":"1.0.0","extra":"y"}\n');
-    writeFileSync(join(seed, 'privpkgs/tldraw-app/package.json'), '{"name":"td","v":"1.0.0"}\n');
-    writeFileSync(join(seed, 'privpkgs/vite-plugin-ligma/package.json'), '{"name":"vpl","v":"1.0.0"}\n');
-    git(seed, 'add', '-A');
-    git(seed, 'commit', '-q', '-m', 'Update dependencies and improve type safety');
-    git(seed, 'push', '-q', 'origin', 'main');
-    git(local, 'fetch', '-q', 'upstream');
-
-    await mirrorPull({ remote: 'upstream' });
-
-    const marker = getReviewPending();
-    // Marker must exist (partial pause active).
-    expect(marker).not.toBeNull();
-    // Match the Conloca shape: review empty, regenerate + outside populated.
-    expect(marker?.review).toEqual([]);
-    expect(marker?.regenerate).toEqual(['bun.lock']);
-    expect(marker?.outside).toEqual([
-      'package.json',
-      'privpkgs/example/package.json',
-      'privpkgs/tldraw-app/package.json',
-      'privpkgs/vite-plugin-ligma/package.json',
-    ]);
-
-    // Capture `console.log` output in-process. `mirrorDiff` must NOT
-    // spawn `git diff` at all in this case - it should only emit the
-    // no-drift message via console.log. (Node's Console captures a
-    // reference to process.stdout at construction time, so patching
-    // process.stdout.write does not intercept console.log - we patch
-    // console.log directly instead.)
+    // Capture console.log (see earlier tests for rationale).
     const originalLog = console.log;
     let captured = '';
     console.log = (...args: unknown[]): void => {
@@ -385,42 +368,37 @@ describe('mirror diff integration - v0.5.7 review-only invariant', () => {
     }
 
     expect(code).toBe(0);
-    // THE user-facing assertions. None of these must appear in stdout.
+    // None of the noise paths must appear.
     expect(captured).not.toContain('bun.lock');
     expect(captured).not.toContain('package.json');
     expect(captured).not.toContain('privpkgs/');
-    // Instead, the empty-review-bucket message must be shown.
+    // The no-drift message must appear.
     expect(captured).toContain('No review drift for this commit.');
   });
 
-  test('mirrorDiff() prints "No review drift" and exits 0 when review bucket is empty', async () => {
-    // Scenario: source touches only regenerate + outside. Review bucket = [].
+  test('mirrorDiff() prints "No review drift" and exits 0 when review bucket is empty (defensive)', () => {
+    // See T3 note: this state is not reachable via normal mirrorPull flow
+    // after v0.5.9, but the defensive branch in mirrorDiff is worth locking
+    // in. Synthesize the marker directly.
     const seed = join(root, 'seed');
-    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v0\n');
-    writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"0"}\n');
-    git(seed, 'add', '-A');
-    git(seed, 'commit', '-q', '-m', 'upstream: seed');
-    git(seed, 'push', '-q', 'origin', 'main');
-    git(local, 'fetch', '-q', 'upstream');
-    git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
-
-    writeFileSync(join(local, 'bun.lock'), 'local-lock\n');
-    git(local, 'add', '-A');
-    git(local, 'commit', '-q', '-m', 'local: seed');
-
-    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock v1\n');
-    writeFileSync(join(seed, 'package.json'), '{"name":"upstream","v":"1"}\n');
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2\n');
     git(seed, 'add', '-A');
     git(seed, 'commit', '-q', '-m', 'bump deps');
     git(seed, 'push', '-q', 'origin', 'main');
     git(local, 'fetch', '-q', 'upstream');
+    const sourceSha = git(local, 'rev-parse', 'upstream/main');
 
-    await mirrorPull({ remote: 'upstream' });
+    setReviewPending({
+      remote: 'upstream',
+      sourceSha,
+      subject: 'bump deps',
+      included: [],
+      review: [],
+      regenerate: ['bun.lock'],
+      outside: ['package.json'],
+      phase: 'review-pause',
+    });
 
-    const marker = getReviewPending();
-    expect(marker?.review).toEqual([]);
-
-    // In-process: patch console.log (see T3 for rationale).
     const originalLog = console.log;
     let captured = '';
     console.log = (...args: unknown[]): void => {
@@ -435,7 +413,6 @@ describe('mirror diff integration - v0.5.7 review-only invariant', () => {
 
     expect(code).toBe(0);
     expect(captured).toContain('No review drift for this commit.');
-    // No raw diff output should have leaked through.
     expect(captured).not.toContain('bun.lock');
     expect(captured).not.toContain('package.json');
   });

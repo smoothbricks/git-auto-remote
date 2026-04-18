@@ -190,6 +190,57 @@ describe('regenerate on a partial (sub-case B)', () => {
   });
 });
 
+describe('regenerate error propagation (v0.5.9)', () => {
+  test('range: regen command non-zero exit HALTS the pull with code 1', async () => {
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2\n');
+    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'pkg: bump A + lock');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    setRegenerateCommand('exit 42');
+
+    const code = await mirrorPull({ remote: 'upstream' });
+    // v0.5.9: non-zero regen exit propagates as pull failure.
+    expect(code).toBe(1);
+    // State: the git am applied the included subset (tracking advanced via
+    // post-applypatch hook), but the amend did NOT happen. We halt loudly
+    // so the user knows something went wrong. Worktree is whatever the
+    // failed regen left it in (possibly unchanged since regen exited 0ly
+    // before doing work).
+  });
+
+  test('sub-case B partial: regen command non-zero exit HALTS with code 1', async () => {
+    // Seed a partial with review + regen content.
+    writeFileSync(join(local, 'packages/reviewed'), 'v1\n');
+    git(local, 'add', '-A');
+    git(local, 'commit', '-q', '-m', 'local: seed reviewed');
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'packages/reviewed'), 'v1\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'up: seed reviewed');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+    git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+
+    writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2\n');
+    writeFileSync(join(seed, 'packages/reviewed'), 'v2\n');
+    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'feat: partial + lock');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/reviewed');
+    setRegenerateCommand('exit 17');
+
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(1);
+  });
+});
+
 describe('regenerate safety: command must not touch paths outside regeneratePaths', () => {
   test('leaked changes outside regeneratePaths are NOT amended; tool continues with dirty tree', async () => {
     const seed = join(root, 'seed');
