@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hookStatus, installHook, uninstallHook } from '../src/lib/hooks.js';
+import { getInstalledHookVersion, hookStatus, installHook, uninstallHook } from '../src/lib/hooks.js';
 
 /**
  * Integration tests: create a real temporary git repo, cd into it, run installer.
@@ -164,5 +164,44 @@ describe('uninstallHook', () => {
     const result = uninstallHook('pre-push');
     expect(result.kind).toBe('not-present');
     expect(existsSync(join(repoDir, '.git/hooks/pre-push'))).toBe(true);
+  });
+});
+
+// v0.7.0 HIGH-4 (see 2026-04-18-audit.md): version-skew detection tests
+describe('getInstalledHookVersion', () => {
+  test('returns null when hook file does not exist', () => {
+    expect(getInstalledHookVersion('post-checkout')).toBeNull();
+  });
+
+  test('returns null when hook exists without our marker block', () => {
+    writeFileSync(join(repoDir, '.git/hooks/post-checkout'), '#!/bin/sh\necho "foreign hook"\n');
+    expect(getInstalledHookVersion('post-checkout')).toBeNull();
+  });
+
+  test('extracts version from installed hook snippet', () => {
+    installHook('post-checkout');
+    const version = getInstalledHookVersion('post-checkout');
+    // Version should match semantic versioning pattern
+    expect(version).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  test('returns null when marker block exists but version line is malformed', () => {
+    // Create a hook with our markers but no proper bunx line
+    const malformed = [
+      '#!/usr/bin/env bash',
+      '',
+      '# >>> git-auto-remote post-checkout 0.5.0 >>>',
+      '# Managed by git-auto-remote.',
+      '# Missing the bunx line with version',
+      '# <<< git-auto-remote post-checkout <<<',
+    ].join('\n');
+    writeFileSync(join(repoDir, '.git/hooks/post-checkout'), malformed, { mode: 0o755 });
+    expect(getInstalledHookVersion('post-checkout')).toBeNull();
+  });
+
+  test('extracts version from pre-push hook correctly', () => {
+    installHook('pre-push');
+    const version = getInstalledHookVersion('pre-push');
+    expect(version).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });

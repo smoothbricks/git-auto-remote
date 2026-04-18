@@ -136,3 +136,37 @@ export function hookStatus(name: HookName): 'absent' | 'present-ours' | 'present
   const existing = readFileSync(path, 'utf8');
   return START_MARKER_RE(name).test(existing) ? 'present-ours' : 'present-foreign';
 }
+
+// v0.7.0 HIGH-4 (see 2026-04-18-audit.md): version-skew detection helper
+// B-MPULL T2-MPULL-09 calls this to warn when installed hook version differs from CLI.
+// The hook snippet contains: bunx --bun git-auto-remote@<VERSION> <hookname>
+// We extract the version from that line within our marker block.
+const VERSION_RE = /bunx --bun git-auto-remote@([^\s]+)/;
+
+/**
+ * Read the installed hook file and extract the git-auto-remote version
+ * from the bunx pin line within our marker block.
+ * Returns null if hook doesn't exist or version can't be parsed.
+ */
+export function getInstalledHookVersion(hookName: string): string | null {
+  const path = join(gitDir(), 'hooks', hookName);
+  if (!existsSync(path)) {
+    return null;
+  }
+
+  const content = readFileSync(path, 'utf8');
+
+  // Only look at content within our marker blocks - avoid matching random user content
+  const blockMatch = content.match(FULL_BLOCK_RE(hookName as HookName));
+  if (!blockMatch) {
+    return null;
+  }
+
+  const blockContent = blockMatch[0];
+  const versionMatch = blockContent.match(VERSION_RE);
+  if (!versionMatch) {
+    return null;
+  }
+
+  return versionMatch[1];
+}
