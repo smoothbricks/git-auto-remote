@@ -1,6 +1,6 @@
 {
   "name": "git-auto-remote",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Automatically route git push/pull to the right remote based on branch ancestry. Useful for public/private fork workflows and multi-upstream repos.",
   "keywords": [
     "git",

@@ -11,8 +11,6 @@ import {
   amInProgress,
   changedPaths,
   commitSubject,
-  configAdd,
-  configGetAll,
   currentBranch,
   fetchRemote,
   git,
@@ -108,10 +106,22 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     return 1;
   }
 
-  // Ensure the tracking-ref refspec is configured so CI clones receive the state.
-  ensureMirrorRefspec(mirror.remote);
-
   // Fetch latest mirror state.
+  //
+  // Pre-v0.6.1 we also called ensureMirrorRefspec(remote) here to add
+  // `+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*` to the
+  // remote's fetch refspec, with the intent of "replicating tracking ref
+  // state server-side so fresh CI clones can see it". The implementation
+  // was actively wrong: with the leading `+`, every `git fetch` FORCE-
+  // overwrote the local tracking ref with the remote's value. The local
+  // clone is the AUTHORITY for its own mirror tracking state - if a
+  // different clone (e.g. CI) had pushed an updated ref to the remote,
+  // our local rolled-back / behind state was silently clobbered, and
+  // the pull then computed `last == head` and exited 0 with zero output,
+  // skipping all in-range commits. The "replication" intent is correctly
+  // expressed via PUSH refspec (callers configure
+  // `remote.<X>.push = refs/git-auto-remote/mirror/*:...`), not fetch.
+  // See test/mirror-pull.integration.test.ts -> 'v0.6.1 regression'.
   try {
     fetchRemote(mirror.remote);
   } catch (e) {
@@ -847,18 +857,4 @@ function printPartialFooter(_remote: string, hasReview: boolean, sourceSha: stri
   console.error(``);
   console.error(`  Continue: git-auto-remote mirror continue`);
   console.error(`  Skip:     git-auto-remote mirror skip`);
-}
-
-/**
- * Ensure `refs/git-auto-remote/mirror/*` is fetched from the given remote,
- * so the tracking ref is replicated server-side and fresh CI clones can see it.
- * Idempotent.
- */
-function ensureMirrorRefspec(remote: string): void {
-  const key = `remote.${remote}.fetch`;
-  const wanted = '+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*';
-  const existing = configGetAll(key);
-  if (!existing.includes(wanted)) {
-    configAdd(key, wanted);
-  }
 }
