@@ -11,21 +11,31 @@ import {
 import { mirrorPull } from './mirror-pull.js';
 
 /**
- * Unified skip command across all pause sub-cases:
+ * Unified skip command across all pause sub-cases.
+ *
+ * INVARIANT (v0.6.3): all paths explicitly advance the tracking ref past
+ * `review.sourceSha`. No external assumptions about prior state - even if
+ * the tracking ref was perturbed between pause and skip (manual
+ * `git update-ref`, fetch clobber from a misconfigured refspec, another
+ * process, etc.), skip re-asserts it so the auto-resumed `mirror pull`
+ * cannot re-encounter the same source commit.
  *
  *   - `git am` in progress (plain range or phase 'am-in-progress'):
  *       reads the source SHA of the stuck patch, runs `git am --skip`,
  *       advances the tracking ref past that SHA, and auto-resumes `mirror pull`.
  *
  *   - phase 'review-pause' (sub-case B):
- *       discards unstaged review content and runs `git reset --hard HEAD~1` to
- *       undo the partial commit `applyPartial` made. Tracking ref already
- *       points past the source SHA, so the next pull resumes past it.
+ *       discards unstaged review content, runs `git reset --hard HEAD~1` to
+ *       undo the partial commit `applyPartial` made, and advances the
+ *       tracking ref past `review.sourceSha`.
  *
  *   - phase 'pure-review-pause' (sub-case C):
- *       discards unstaged review content. There is no HEAD commit to reset.
- *       Tracking ref was already advanced to source at pause time, so nothing
- *       else to do.
+ *       discards unstaged review content, advances the tracking ref past
+ *       `review.sourceSha`. There is no HEAD commit to reset.
+ *
+ *   - phase 'am-in-progress' fallback (marker says am but no am is running):
+ *       same cleanup as review-pause, then advances the tracking ref past
+ *       `review.sourceSha`.
  */
 export async function mirrorSkip(remoteArg?: string): Promise<number> {
   if (amInProgress()) {
@@ -50,6 +60,13 @@ export async function mirrorSkip(remoteArg?: string): Promise<number> {
     gitTry('clean', '-fd', '--', ...review.review);
     git('reset', '--hard', 'HEAD~1');
     clearReviewPending();
+    // v0.6.3: explicitly re-assert the tracking ref past sourceSha. The ref
+    // was advanced at pause entry by applyPartial's successful `git am`, but
+    // any external perturbation between then and now (fetch clobber via a
+    // misconfigured remote.<X>.fetch refspec, manual `git update-ref`, a
+    // second process) could have rewound it. Without this, the auto-resumed
+    // `mirrorPull` below would re-encounter the same source commit.
+    updateTrackingRef(remote, review.sourceSha);
     console.error(`[mirror ${remote}] Skipped:  ${review.sourceSha.slice(0, 8)}  ${review.subject}`);
     return mirrorPull({ remote });
   }
@@ -57,6 +74,8 @@ export async function mirrorSkip(remoteArg?: string): Promise<number> {
     discardReviewPaths(review.review);
     clearPendingCommit();
     clearReviewPending();
+    // v0.6.3: see review-pause branch above - re-assert explicitly.
+    updateTrackingRef(remote, review.sourceSha);
     console.error(`[mirror ${remote}] Skipped:  ${review.sourceSha.slice(0, 8)}  ${review.subject}`);
     return mirrorPull({ remote });
   }
@@ -68,6 +87,8 @@ export async function mirrorSkip(remoteArg?: string): Promise<number> {
   gitTry('clean', '-fd', '--', ...review.review);
   git('reset', '--hard', 'HEAD~1');
   clearReviewPending();
+  // v0.6.3: see review-pause branch - re-assert explicitly.
+  updateTrackingRef(remote, review.sourceSha);
   return mirrorPull({ remote });
 }
 

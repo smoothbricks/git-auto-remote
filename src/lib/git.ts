@@ -264,7 +264,23 @@ export function readCommitMeta(sha: string): CommitMeta {
   return { authorName, authorEmail, authorDate, message };
 }
 
-/** Quiet `git fetch <remote>`; throws GitError on failure. */
-export function fetchRemote(remote: string): void {
-  git('fetch', '--quiet', remote);
+/**
+ * Quiet `git fetch <remote>`; throws GitError on failure.
+ *
+ * When `refspec` is provided, git uses ONLY that refspec for the fetch,
+ * ignoring any configured `remote.<X>.fetch` entries. Use this when
+ * fetching for tool-internal purposes (e.g. mirror pull's syncBranch
+ * refresh) to be immune to misconfigured user fetch refspecs - for
+ * example a leftover `+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*`
+ * that would otherwise force-overwrite our own tracking ref with whatever
+ * value happens to live on the remote.
+ *
+ * When `refspec` is omitted, the fetch honors all configured refspecs -
+ * appropriate for user-initiated contexts (e.g. hook entry points) where
+ * the user's intent is to run a normal `git fetch`.
+ */
+export function fetchRemote(remote: string, refspec?: string): void {
+  const args = ['fetch', '--quiet', remote];
+  if (refspec) args.push(refspec);
+  git(...args);
 }
