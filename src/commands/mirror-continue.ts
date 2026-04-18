@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { applyReviewToWorktree } from '../lib/apply.js';
 import {
   amInProgress,
+  git,
   gitTry,
   hasStagedChanges,
   hasUnresolvedMergeConflicts,
@@ -18,6 +19,7 @@ import {
   getReviewPending,
   type ReviewPendingState,
   setReviewPending,
+  updateTrackingRef,
 } from '../lib/mirror-state.js';
 import { mirrorPull } from './mirror-pull.js';
 
@@ -61,10 +63,10 @@ export async function mirrorContinue(remoteArg?: string): Promise<number> {
   }
 
   if (review.phase === 'review-pause') {
-    return continueReviewPause(remote, review.review);
+    return continueReviewPause(remote, review);
   }
   if (review.phase === 'pure-review-pause') {
-    return continuePureReviewPause(remote, review.review);
+    return continuePureReviewPause(remote, review);
   }
   // phase === 'am-in-progress' but amInProgress() returned false: an earlier
   // `git am --continue` must have finished without going through our wrapper
@@ -137,17 +139,69 @@ async function continueAm(remoteArg?: string): Promise<number> {
   // the just-applied included subset).
   const review = getReviewPending();
   if (review && review.phase === 'am-in-progress' && review.remote === remote) {
+    // v0.7.0 CRIT-1 (see 2026-04-18-audit.md): re-assert tracking before
+    // transitioning. The post-applypatch hook may not have fired (or the
+    // user may have deleted/rewound the ref), so we explicitly set it.
+    updateTrackingRef(remote, review.sourceSha);
     return postAmTransition(remote, review);
   }
 
+  // v0.7.0 CRIT-1 (see 2026-04-18-audit.md): tail-call to mirrorPull must
+  // re-assert tracking. Any external perturbation between pause and continue
+  // (manual update-ref, fetch clobber via misconfigured refspec, parallel
+  // process) could have rewound it.
+  updateTrackingRef(remote, review?.sourceSha ?? 'HEAD');
   return mirrorPull({ remote });
+}
+
+/**
+ * Verify that HEAD contains the included subset of the source commit.
+ * Compares the tree objects for the included paths between HEAD and sourceSha.
+ * Returns true if they match (HEAD has the expected content), false otherwise.
+ */
+function headContainsIncludedSubset(sourceSha: string, included: readonly string[]): boolean {
+  if (included.length === 0) {
+    // No included paths means nothing to verify - vacuously true
+    return true;
+  }
+  // Use git diff-tree to compare HEAD and sourceSha for the included paths.
+  // -s/--no-patch suppresses patch output, we only care about exit code.
+  // Exit code 0 means no difference (HEAD matches sourceSha for these paths).
+  try {
+    const args = ['diff-tree', '-s', '--no-patch', 'HEAD', sourceSha, '--', ...included];
+    git(...args);
+    return true;
+  } catch {
+    // Non-zero exit code means there's a difference
+    return false;
+  }
 }
 
 /**
  * Transition from am-in-progress to review-pause: overlay the review subset to
  * the working tree unstaged and pause for the user to stage/discard.
+ *
+ * INVARIANT (v0.7.0): verifies HEAD contains the included subset of sourceSha
+ * before proceeding. If the user bypassed the am (e.g., `git am --abort`),
+ * HEAD won't match and we refuse rather than overlaying review on wrong base.
  */
 async function postAmTransition(remote: string, reviewState: ReviewPendingState): Promise<number> {
+  // v0.7.0 CRIT-2 (see 2026-04-18-audit.md): verify HEAD contains included subset.
+  // If the user aborted the am or reset HEAD, we must not overlay review content
+  // on an inconsistent base.
+  if (!headContainsIncludedSubset(reviewState.sourceSha, reviewState.included)) {
+    console.error(
+      `[mirror ${remote}] HEAD does not contain the expected included subset from ${reviewState.sourceSha.slice(0, 8)}.`,
+    );
+    console.error(
+      `[mirror ${remote}]   The am may have been aborted or HEAD was reset. Recover with:`,
+    );
+    console.error(`    git-auto-remote mirror skip ${remote}   # skip this commit and continue`);
+    console.error(`    git reset --hard HEAD~1                 # undo partial commit if any`);
+    console.error(`    git am --abort                          # bail out entirely`);
+    return 1;
+  }
+
   if (reviewState.review.length === 0) {
     // No review content to overlay; just resume.
     clearReviewPending();
@@ -205,8 +259,12 @@ async function postAmTransition(remote: string, reviewState: ReviewPendingState)
  * also explicitly sets GIT_COMMITTER_* env so committer matches author,
  * preserving the invariant established when git am applied the patch).
  * Then discard unstaged review leftovers and resume the sync.
+ *
+ * INVARIANT (v0.7.0): explicitly re-asserts the tracking ref to sourceSha
+ * before tail-calling mirrorPull. Mirrors the v0.6.3 skip fix - protects
+ * against external perturbation between pause and continue.
  */
-async function continueReviewPause(remote: string, reviewPaths: readonly string[]): Promise<number> {
+async function continueReviewPause(remote: string, reviewState: ReviewPendingState): Promise<number> {
   if (hasStagedChanges()) {
     // Amend HEAD: --no-edit keeps author name/email, author-date, and the
     // commit message. v0.6.0: explicitly set GIT_COMMITTER_* so committer
@@ -228,7 +286,7 @@ async function continueReviewPause(remote: string, reviewPaths: readonly string[
       return r.status ?? 1;
     }
   }
-  discardReviewPaths(reviewPaths);
+  discardReviewPaths(reviewState.review);
   // If anything else (non-review) is dirty, bail out so the user notices.
   if (workingTreeDirty()) {
     console.error(
@@ -237,6 +295,9 @@ async function continueReviewPause(remote: string, reviewPaths: readonly string[
     return 1;
   }
   clearReviewPending();
+  // v0.7.0 CRIT-1 (see 2026-04-18-audit.md): re-assert tracking before
+  // resuming. Any external perturbation could have deleted or rewound it.
+  updateTrackingRef(remote, reviewState.sourceSha);
   return mirrorPull({ remote });
 }
 
@@ -245,8 +306,12 @@ async function continueReviewPause(remote: string, reviewPaths: readonly string[
  * review content, create a fresh commit with the source's author/date/message
  * (via GIT_AUTHOR_* env vars). Otherwise no-op (Q2a: silent skip-equivalent).
  * Tracking ref was already advanced to source SHA when the pause was entered.
+ *
+ * INVARIANT (v0.7.0): explicitly re-asserts the tracking ref to sourceSha
+ * before tail-calling mirrorPull. Mirrors the v0.6.3 skip fix - protects
+ * against external perturbation between pause and continue.
  */
-async function continuePureReviewPause(remote: string, reviewPaths: readonly string[]): Promise<number> {
+async function continuePureReviewPause(remote: string, reviewState: ReviewPendingState): Promise<number> {
   const pending = getPendingCommit();
   if (hasStagedChanges()) {
     if (!pending) {
@@ -274,7 +339,7 @@ async function continuePureReviewPause(remote: string, reviewPaths: readonly str
       return r.status ?? 1;
     }
   }
-  discardReviewPaths(reviewPaths);
+  discardReviewPaths(reviewState.review);
   if (workingTreeDirty()) {
     console.error(
       `[mirror ${remote}] Working tree still has changes outside review paths; commit or stash before continuing.`,
@@ -283,6 +348,9 @@ async function continuePureReviewPause(remote: string, reviewPaths: readonly str
   }
   clearPendingCommit();
   clearReviewPending();
+  // v0.7.0 CRIT-1 (see 2026-04-18-audit.md): re-assert tracking before
+  // resuming. Any external perturbation could have deleted or rewound it.
+  updateTrackingRef(remote, reviewState.sourceSha);
   return mirrorPull({ remote });
 }
 
