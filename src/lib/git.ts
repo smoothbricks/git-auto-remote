@@ -76,7 +76,10 @@ export function currentBranch(): string | null {
 
 /** Resolve a ref to a SHA, or null if invalid. */
 export function revParse(ref: string): string | null {
-  return gitTry('rev-parse', '--verify', '--quiet', ref);
+  // Use^{commit} suffix to ensure the object exists AND is a commit.
+  // This prevents 40-char hex strings that don't exist from being "validated"
+  // by git rev-parse --verify (some git versions accept them as-is).
+  return gitTry('rev-parse', '--verify', '--quiet', `${ref}^{commit}`);
 }
 
 /** Return the path to the .git directory (handles worktrees and submodules). */
