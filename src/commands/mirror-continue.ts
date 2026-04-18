@@ -1,6 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { applyReviewToWorktree } from '../lib/apply.js';
-import { amInProgress, gitTry, hasStagedChanges, hasUnresolvedMergeConflicts, workingTreeDirty } from '../lib/git.js';
+import {
+  amInProgress,
+  gitTry,
+  hasStagedChanges,
+  hasUnresolvedMergeConflicts,
+  readCommitMeta,
+  workingTreeDirty,
+} from '../lib/git.js';
 import { getMirrorConfig } from '../lib/mirror-config.js';
 import {
   clearMirrorInProgress,
@@ -25,9 +32,10 @@ import { mirrorPull } from './mirror-pull.js';
  *
  *   - phase 'review-pause':
  *       amends HEAD with any staged review content (author + author-date
- *       preserved by --no-edit, committer date is updated to now - inherent
- *       to git, not fixable), discards any unstaged review leftovers, and
- *       resumes `mirror pull` from where the tracking ref now sits.
+ *       preserved by --no-edit; v0.6.0 also sets GIT_COMMITTER_* env so
+ *       committer identity matches author), discards any unstaged review
+ *       leftovers, and resumes `mirror pull` from where the tracking ref
+ *       now sits.
  *
  *   - phase 'pure-review-pause':
  *       creates a fresh commit using the source's author/email/date/message
@@ -193,15 +201,26 @@ async function postAmTransition(remote: string, reviewState: ReviewPendingState)
 /**
  * sub-case B resume: HEAD is the included-subset commit with the source's
  * author + author-date. If the user staged any review content, amend HEAD
- * to roll it in (--no-edit preserves author + author-date + message; committer
- * date is refreshed by git). Then discard unstaged review leftovers and
- * resume the sync.
+ * to roll it in (--no-edit preserves author + author-date + message; v0.6.0
+ * also explicitly sets GIT_COMMITTER_* env so committer matches author,
+ * preserving the invariant established when git am applied the patch).
+ * Then discard unstaged review leftovers and resume the sync.
  */
 async function continueReviewPause(remote: string, reviewPaths: readonly string[]): Promise<number> {
   if (hasStagedChanges()) {
     // Amend HEAD: --no-edit keeps author name/email, author-date, and the
-    // commit message; committer date is unavoidably refreshed by git.
+    // commit message. v0.6.0: explicitly set GIT_COMMITTER_* so committer
+    // name/email/date match author - git would otherwise refresh committer
+    // to the current user / current time.
+    const headMeta = readCommitMeta('HEAD');
+    const amendEnv = {
+      ...process.env,
+      GIT_COMMITTER_NAME: headMeta.authorName,
+      GIT_COMMITTER_EMAIL: headMeta.authorEmail,
+      GIT_COMMITTER_DATE: headMeta.authorDate,
+    };
     const r = spawnSync('git', ['commit', '--amend', '--no-edit'], {
+      env: amendEnv,
       stdio: ['ignore', 'inherit', 'inherit'],
     });
     if ((r.status ?? 0) !== 0) {
@@ -236,11 +255,15 @@ async function continuePureReviewPause(remote: string, reviewPaths: readonly str
       );
       return 1;
     }
+    // v0.6.0: committer = author across all commits this tool creates.
     const env = {
       ...process.env,
       GIT_AUTHOR_NAME: pending.authorName,
       GIT_AUTHOR_EMAIL: pending.authorEmail,
       GIT_AUTHOR_DATE: pending.authorDate,
+      GIT_COMMITTER_NAME: pending.authorName,
+      GIT_COMMITTER_EMAIL: pending.authorEmail,
+      GIT_COMMITTER_DATE: pending.authorDate,
     };
     const r = spawnSync('git', ['commit', '-q', '-m', pending.message], {
       env,

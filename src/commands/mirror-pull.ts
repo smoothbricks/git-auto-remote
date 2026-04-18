@@ -547,11 +547,15 @@ function handlePureReview(
   if (review.length === 0) {
     if (regenStaged) {
       const meta = readCommitMeta(sha);
+      // v0.6.0: committer = author across all commits this tool creates.
       const env = {
         ...process.env,
         GIT_AUTHOR_NAME: meta.authorName,
         GIT_AUTHOR_EMAIL: meta.authorEmail,
         GIT_AUTHOR_DATE: meta.authorDate,
+        GIT_COMMITTER_NAME: meta.authorName,
+        GIT_COMMITTER_EMAIL: meta.authorEmail,
+        GIT_COMMITTER_DATE: meta.authorDate,
       };
       const commitResult = spawnSync('git', ['commit', '-q', '-m', meta.message], {
         env,
@@ -680,11 +684,15 @@ function finalizePureReviewAsResolved(
   // If index has staged content, make the commit with preserved metadata.
   // If neither, advance tracking (treat as "no-op, move on").
   if (hasStagedChanges()) {
+    // v0.6.0: committer = author across all commits this tool creates.
     const env = {
       ...process.env,
       GIT_AUTHOR_NAME: meta.authorName,
       GIT_AUTHOR_EMAIL: meta.authorEmail,
       GIT_AUTHOR_DATE: meta.authorDate,
+      GIT_COMMITTER_NAME: meta.authorName,
+      GIT_COMMITTER_EMAIL: meta.authorEmail,
+      GIT_COMMITTER_DATE: meta.authorDate,
     };
     const r = spawnSync('git', ['commit', '-q', '-m', meta.message], {
       env,

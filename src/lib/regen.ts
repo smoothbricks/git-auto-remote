@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { git, hasStagedChanges } from './git.js';
+import { git, hasStagedChanges, readCommitMeta } from './git.js';
 
 /**
  * Outcome of running the configured `regenerateCommand`:
@@ -141,7 +141,20 @@ export function runRegenerate(
   }
 
   // mode === 'amend': amend the staged content into HEAD.
+  //
+  // v0.6.0: preserve committer = author on the amended commit. Without
+  // GIT_COMMITTER_* env, `git commit --amend --no-edit` would refresh
+  // committer to the current user, breaking the invariant that applyRange
+  // established for the just-applied commit.
+  const headMeta = readCommitMeta('HEAD');
+  const amendEnv = {
+    ...process.env,
+    GIT_COMMITTER_NAME: headMeta.authorName,
+    GIT_COMMITTER_EMAIL: headMeta.authorEmail,
+    GIT_COMMITTER_DATE: headMeta.authorDate,
+  };
   const amend = spawnSync('git', ['commit', '--amend', '--no-edit'], {
+    env: amendEnv,
     stdio: ['ignore', 'inherit', 'inherit'],
   });
   if ((amend.status ?? 0) !== 0) {
