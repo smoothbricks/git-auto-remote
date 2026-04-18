@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   applyPartial,
@@ -14,6 +16,7 @@ import {
   currentBranch,
   fetchRemote,
   git,
+  gitDir,
   gitTry,
   hasStagedChanges,
   hasUnresolvedMergeConflicts,
@@ -25,12 +28,14 @@ import {
   workingTreeDirty,
 } from '../lib/git.js';
 import { runPartialHandler } from '../lib/handler.js';
+import { getInstalledHookVersion } from '../lib/hooks.js';
 import { getMirrorConfig, listMirrorConfigs, type MirrorConfig } from '../lib/mirror-config.js';
 import { runRegenerate } from '../lib/regen.js';
 import {
   clearMirrorInProgress,
   clearPendingCommit,
   clearReviewPending,
+  getMirrorInProgress,
   getReviewPending,
   readTrackingRef,
   setMirrorInProgress,
@@ -39,6 +44,7 @@ import {
   trackingRefName,
   updateTrackingRef,
 } from '../lib/mirror-state.js';
+import { VERSION } from '../lib/version.js';
 
 export type MirrorPullOptions = {
   /** Target remote; if omitted, run for every configured mirror in turn. */
@@ -76,6 +82,15 @@ export async function mirrorPull(options: MirrorPullOptions): Promise<number> {
 }
 
 async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise<number> {
+  // v0.7.0 HIGH-4 (see 2026-04-18-audit.md): version-skew warning
+  // Check if installed hook version differs from current CLI version
+  const hookVersion = getInstalledHookVersion('post-applypatch');
+  if (hookVersion && hookVersion !== VERSION) {
+    console.error(
+      `[git-auto-remote] WARNING: installed hook pins git-auto-remote@${hookVersion} but you are running @${VERSION}. State file format may differ. Run 'git-auto-remote setup' to refresh hooks.`
+    );
+  }
+
   // Skip if we're not on this mirror's target branch.
   const branch = currentBranch();
   if (!branch) {
@@ -85,6 +100,16 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   if (branch !== mirror.syncTargetBranch) {
     // Silent skip: different mirrors have different target branches; not an error.
     return 0;
+  }
+
+  // v0.7.0 HIGH-6 (see 2026-04-18-audit.md): merge-in-progress safety
+  // Check for MERGE_HEAD before checking other preconditions - `git am` during a
+  // merge produces undefined behavior and can corrupt the merge state.
+  if (existsSync(join(gitDir(), 'MERGE_HEAD'))) {
+    console.error(
+      `[mirror ${mirror.remote}] merge in progress; resolve before mirror pull`
+    );
+    return 1;
   }
 
   // Hard preconditions: no in-progress `git am`, no unresolved review, clean tree.
@@ -103,6 +128,17 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   }
   if (workingTreeDirty()) {
     console.error(`[mirror ${mirror.remote}] Working tree is dirty; commit or stash first.`);
+    return 1;
+  }
+
+  // v0.7.0 CRIT-3 (see 2026-04-18-audit.md): stale-sentinel handling
+  // If sentinel is set but no git am is running, the previous run left state
+  // behind (crash, manual abort, etc.). Refuse and tell user how to clean up.
+  const inProgressRemote = getMirrorInProgress();
+  if (inProgressRemote !== null && !amInProgress()) {
+    console.error(
+      `[git-auto-remote] stale mirror-in-progress sentinel for ${inProgressRemote} but no git am running. Run 'git-auto-remote mirror skip ${inProgressRemote}' to clean up.`
+    );
     return 1;
   }
 
