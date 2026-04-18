@@ -187,7 +187,33 @@ And positional args: `<remote> <source-sha>`. Full source diff available via `gi
 
 ### Tracking-ref durability
 
-The last-synced position per mirror is stored under `refs/git-auto-remote/mirror/<remote>`. With `pushSyncRef=true` (default), the ref is pushed to the remote after each advance — so CI clones (which start with a fresh `.git/`) pick up the state automatically. `setup` also adds a fetch refspec (`+refs/git-auto-remote/mirror/*:...`) to each mirror's remote config.
+The last-synced position per mirror is stored under `refs/git-auto-remote/mirror/<remote>/last-synced`. With `pushSyncRef=true` (default), the ref is pushed to the remote after each advance — so CI clones (which start with a fresh `.git/`) pick up the state automatically.
+
+#### SECURITY: cross-direction push refspecs leak source content
+
+The tracking ref `refs/git-auto-remote/mirror/<remote>/last-synced` stores a SHA that originated on `<remote>`. The commit and its full ancestry live in the local object DB after `mirror pull` — that's normal.
+
+Pushing this ref to a DIFFERENT remote, however, transfers the ENTIRE object closure (commit + every reachable ancestor + their trees + their blobs) to that other remote. If `<remote>` contains private content and the destination is a public-facing mirror, the destination's object DB now contains the full private history, accessible to anyone via:
+
+```bash
+git fetch <public-url> 'refs/git-auto-remote/*:refs/git-auto-remote/*'
+git checkout refs/git-auto-remote/mirror/<remote>/last-synced
+```
+
+**Rule of thumb**: configure each remote's push refspec to push only its OWN tracking ref, not other remotes' tracking refs:
+
+```bash
+# SAFE: each remote stores only refs pointing at its own commits
+git config --add remote.public-repo.push  'refs/git-auto-remote/mirror/public-repo/*:refs/git-auto-remote/mirror/public-repo/*'
+git config --add remote.private-repo.push 'refs/git-auto-remote/mirror/private-repo/*:refs/git-auto-remote/mirror/private-repo/*'
+# (a private remote MAY safely also carry other remotes' refs - private content stays
+#  private; public-content-on-private is a no-op since public is already public.)
+
+# UNSAFE on a public remote (leaks private commit ancestry):
+git config --add remote.public-repo.push 'refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*'
+```
+
+Pre-v0.6.1 the tool itself auto-added a force-fetch refspec `+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*` to mirror remotes; that was removed in v0.6.1 because it silently clobbered local tracking state on every fetch. Push refspecs are the user's responsibility.
 
 ## Commands
 
@@ -198,7 +224,10 @@ git-auto-remote detect [ref]              Ancestry analysis
 git-auto-remote uninstall                 Remove hook blocks
 
 git-auto-remote mirror list               Show configured mirrors
-git-auto-remote mirror status [<remote>]  Show sync state
+git-auto-remote mirror status [<remote>] [--remotes]  Show sync state.
+                                          With --remotes, also runs ls-remote
+                                          on each mirror remote and compares
+                                          tracking refs (drift diagnostic).
 git-auto-remote mirror bootstrap <remote> <sha> [--force]
 git-auto-remote mirror pull [<remote>] [--non-interactive] [--on-partial <cmd>]
 git-auto-remote mirror continue [<remote>]     # resolve any pause sub-case

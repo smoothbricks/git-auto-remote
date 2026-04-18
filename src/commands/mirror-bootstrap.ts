@@ -24,6 +24,28 @@ import { readTrackingRef, updateTrackingRef } from '../lib/mirror-state.js';
  * bootstrap entirely, just run `mirror pull`).
  *
  * Refuses to overwrite an existing tracking ref (use `--force` to re-bootstrap).
+ *
+ * SECURITY NOTE on cross-direction tracking refs:
+ *   The tracking ref `refs/git-auto-remote/mirror/<remote>/last-synced`
+ *   stores a SHA that originated on `<remote>`. The commit and its full
+ *   ancestry (every tree, every blob) live in the local object DB after
+ *   bootstrap and any subsequent `mirror pull`. THIS IS NORMAL.
+ *
+ *   What is NOT normal is pushing this ref to a DIFFERENT remote. A push
+ *   transfers full object closure - the SHA + every reachable commit +
+ *   their trees + their blobs. If `<remote>` contains private content and
+ *   you push the tracking ref to a public-facing remote, that public
+ *   remote's object DB now contains the entire private history,
+ *   accessible to anyone via:
+ *
+ *     git fetch <public-url> 'refs/git-auto-remote/*:refs/git-auto-remote/*'
+ *     git checkout refs/git-auto-remote/mirror/<remote>/last-synced
+ *
+ *   Configure push refspecs accordingly: only push
+ *   `refs/git-auto-remote/mirror/<dest-remote>/*` to <dest-remote>,
+ *   never `refs/git-auto-remote/mirror/<other-remote>/*`. The
+ *   "same-direction-only" rule keeps each remote storing only refs
+ *   pointing at its own commits (which it already has anyway).
  */
 export function mirrorBootstrap(remote: string, shaArg: string, force: boolean): number {
   const mirror = getMirrorConfig(remote);
