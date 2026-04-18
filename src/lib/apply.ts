@@ -207,15 +207,14 @@ export function applyReviewToWorktree(
     return 'conflict';
   }
 
-  // No unresolved merge state from here on. Safe to unstage. We want review
-  // content UNSTAGED so `mirror continue` only amends when the user
-  // explicitly `git add`s, so we unstage anything --3way staged.
-  const stagedOut = gitTry('diff', '--cached', '--name-only');
-  if (stagedOut) {
-    const stagedPaths = stagedOut.split('\n').filter((p) => p.length > 0);
-    if (stagedPaths.length > 0) {
-      gitTry('reset', 'HEAD', '--', ...stagedPaths);
-    }
+  // No unresolved merge state from here on. We want REVIEW content UNSTAGED
+  // so `mirror continue` only amends when the user explicitly `git add`s.
+  // Unstage ONLY the review paths - not everything in the index - because
+  // v0.5.9 may have staged regenerate content BEFORE this function ran
+  // (sub-case C: regen-staged-then-review-overlaid workflow). Blanket
+  // `reset HEAD -- <all staged>` would wipe that regen staging.
+  if (reviewPaths.length > 0) {
+    gitTry('reset', 'HEAD', '--', ...reviewPaths);
   }
 
   if (applyStatus === 0) return 'applied';

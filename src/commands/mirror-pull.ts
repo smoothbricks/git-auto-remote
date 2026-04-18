@@ -214,8 +214,20 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
       // touch regeneratePaths don't need regen (their inputs either didn't
       // change the derived output or will be handled the next time the user
       // runs their normal install/build workflow).
+      //
+      // v0.5.9: propagate command-failed as hard error. Silent skip used to
+      // cause stale derived state to compound across commits.
       if (mirror.regenerateCommand && mirror.regeneratePaths.length > 0 && anyHasRegenerate(seg.commits)) {
-        runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote);
+        const regenResult = runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote, 'amend');
+        if (regenResult.outcome === 'command-failed') {
+          console.error(`[mirror ${mirror.remote}] regenerate command failed after applying range; halting.`);
+          console.error(`[mirror ${mirror.remote}]   HEAD is at the last applied commit (un-amended for regen).`);
+          console.error(
+            `[mirror ${mirror.remote}]   Fix the command, then manually run it + 'git commit --amend --no-edit'`,
+          );
+          console.error(`[mirror ${mirror.remote}]   and re-run 'mirror pull' to continue.`);
+          return 1;
+        }
       }
       // Count what we applied vs skipped.
       for (const c of seg.commits) {
@@ -374,8 +386,18 @@ async function handlePartial(
   // Run regenerate BEFORE the review overlay (if the source commit touched
   // any regeneratePaths) so HEAD reflects included + regen, and the worktree
   // shows only the review content as unstaged.
+  //
+  // v0.5.9: propagate command-failed as hard error (see runRegenerate docs).
   if (mirror.regenerateCommand && mirror.regeneratePaths.length > 0 && regenerate.length > 0) {
-    runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote);
+    const regenResult = runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote, 'amend');
+    if (regenResult.outcome === 'command-failed') {
+      console.error(
+        `[mirror ${mirror.remote}] regenerate command failed on partial ${commit.sha.slice(0, 8)}; halting.`,
+      );
+      console.error(`[mirror ${mirror.remote}]   HEAD has the included subset un-amended. Fix the command, manually`);
+      console.error(`[mirror ${mirror.remote}]   run it + 'git commit --amend --no-edit', then re-run 'mirror pull'.`);
+      return { kind: 'error' };
+    }
   }
 
   // v0.5.8: empty review bucket = nothing for a human (or handler) to decide.
@@ -498,17 +520,76 @@ function handlePureReview(
   _trackingBefore: string | null,
 ): PartialResult {
   const handler = options.onPartial ?? mirror.partialHandler;
-  printPartialHeader(mirror.remote, subject, sha, review, regenerate, outside);
 
-  // MVP: regenerate is NOT auto-run for pure-review-pause, since there's no
-  // HEAD commit to amend onto. Let the user run the command themselves after
-  // staging + `mirror continue` (or just rely on their next normal `bun i`
-  // workflow to reconcile).
+  // v0.5.9 INVARIANT: if source commit touches regenerate paths, regen MUST
+  // run - regardless of sub-case. Run it FIRST (before any pause / commit
+  // synthesis decisions) in stage-only mode: the inside-scope content is
+  // staged but not committed; the caller (this function) decides whether
+  // to commit it with source metadata (empty-review) or leave it staged
+  // for `mirror continue` to pick up alongside user-staged review hunks
+  // (pure-review-pause).
+  let regenStaged = false;
   if (regenerate.length > 0 && mirror.regenerateCommand) {
-    console.error(
-      `[mirror ${mirror.remote}]   (regenerate paths touched: run '${mirror.regenerateCommand}' after continue if needed)`,
-    );
+    const regenResult = runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote, 'stage-only');
+    if (regenResult.outcome === 'command-failed') {
+      console.error(`[mirror ${mirror.remote}] regenerate command failed on ${sha.slice(0, 8)}; halting.`);
+      console.error(`[mirror ${mirror.remote}]   No HEAD commit was created. State is clean - fix the regenerate`);
+      console.error(`[mirror ${mirror.remote}]   command and re-run 'mirror pull'.`);
+      return { kind: 'error' };
+    }
+    regenStaged = regenResult.staged;
   }
+
+  // Sub-case C.1: empty review bucket (Conloca 0c18e179 shape). Everything is
+  // mechanical now - no human decision. Synthesize a commit with source
+  // metadata if regen produced content, else just advance tracking. Handler
+  // is skipped (consistent with the sub-case B empty-review invariant).
+  if (review.length === 0) {
+    if (regenStaged) {
+      const meta = readCommitMeta(sha);
+      const env = {
+        ...process.env,
+        GIT_AUTHOR_NAME: meta.authorName,
+        GIT_AUTHOR_EMAIL: meta.authorEmail,
+        GIT_AUTHOR_DATE: meta.authorDate,
+      };
+      const commitResult = spawnSync('git', ['commit', '-q', '-m', meta.message], {
+        env,
+        stdio: ['ignore', 'inherit', 'inherit'],
+      });
+      if ((commitResult.status ?? 0) !== 0) {
+        console.error(
+          `[mirror ${mirror.remote}] failed to synthesize regenerate-only commit for ${sha.slice(0, 8)}; halting.`,
+        );
+        return { kind: 'error' };
+      }
+      updateTrackingRef(mirror.remote, sha);
+      console.error(
+        `[mirror ${mirror.remote}] Partial auto-applied: ${sha.slice(0, 8)}  ${subject}  (regenerate only)`,
+      );
+      if (regenerate.length > 0) {
+        console.error(`  Regenerated: ${regenerate.join(', ')}`);
+      }
+      if (outside.length > 0) {
+        console.error(`  Outside (dropped): ${outside.join(', ')}`);
+      }
+      return { kind: 'applied' };
+    }
+    // No regen staged: either no regenerate paths, or regen was a no-op.
+    updateTrackingRef(mirror.remote, sha);
+    const qualifier = regenerate.length > 0 ? '(non-sync only, no regen delta)' : '(non-sync only, no regenerate)';
+    console.error(`[mirror ${mirror.remote}] Partial auto-applied: ${sha.slice(0, 8)}  ${subject}  ${qualifier}`);
+    if (outside.length > 0) {
+      console.error(`  Outside (dropped): ${outside.join(', ')}`);
+    }
+    return { kind: 'skipped' };
+  }
+
+  // Sub-case C.2: review bucket non-empty. Regen (if any) is already staged.
+  // Overlay review content UNSTAGED on top. `mirror continue` will call
+  // `continuePureReviewPause` which commits the full index (regen + user-staged
+  // review hunks) as ONE commit with source metadata.
+  printPartialHeader(mirror.remote, subject, sha, review, regenerate, outside);
 
   // Apply review overlay now so handler / user can see and manipulate.
   const overlay = applyReviewToWorktree(sha, review, mirror.excludePaths);
