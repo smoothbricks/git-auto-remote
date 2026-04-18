@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { amInProgress, currentBranch, gitTry, isAncestorOf, listCommitsInRange, revParse } from '../lib/git.js';
+import { amInProgress, configGetAll, currentBranch, gitTry, isAncestorOf, listCommitsInRange, revParse } from '../lib/git.js';
 import { getMirrorConfig, listMirrorConfigs } from '../lib/mirror-config.js';
 import { getReviewPending, readTrackingRef } from '../lib/mirror-state.js';
 
@@ -81,6 +81,21 @@ export function mirrorStatus(remoteArg?: string, options: { showRemotes?: boolea
 
     if (options.showRemotes) {
       printRemoteMirrorRefs(m.remote);
+    }
+
+    // v0.7.0 HIGH-3 (see 2026-04-18-audit.md): Detect and warn about legacy
+    // fetch refspecs auto-added by pre-v0.6.1 versions. These refspecs cause
+    // out-of-band fetches (user, editor plugin, hook) to silently clobber
+    // the local tracking ref, breaking the tool's state machine.
+    const fetchRefspecs = configGetAll(`remote.${m.remote}.fetch`);
+    const hasBadRefspec = fetchRefspecs.some((spec) =>
+      /^\+?refs\/git-auto-remote\/mirror\//.test(spec)
+    );
+    if (hasBadRefspec) {
+      console.warn(`[git-auto-remote] WARNING: remote.${m.remote}.fetch contains '+refs/git-auto-remote/mirror/*:...'`);
+      console.warn('  This was auto-added by pre-v0.6.1 of this tool and silently clobbers your');
+      console.warn('  local tracking ref on every fetch (yours or external). Remove with:');
+      console.warn(`    git config --unset remote.${m.remote}.fetch '^\\+refs/git-auto-remote/mirror'`);
     }
   }
   return 0;
