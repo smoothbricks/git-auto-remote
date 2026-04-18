@@ -989,4 +989,84 @@ describe('mirror pull with root commits on the mirror', () => {
     const trackingAfter = git(freshLocal, 'rev-parse', TRACKING_UPSTREAM);
     expect(trackingAfter.length).toBe(40);
   });
+
+  describe('v0.6.1 regression: must not silently fast-forward via fetch clobber', () => {
+    /**
+     * Pre-v0.6.1 bug: mirror pull called `ensureMirrorRefspec` which added
+     *   +refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*
+     * to the remote's fetch refspec, then ran `git fetch <remote>`. With the
+     * leading `+`, the fetch FORCE-overwrote the local mirror tracking ref
+     * with whatever the remote had at that path. So if a different clone
+     * (e.g. CI) had previously pushed an updated tracking ref to the remote,
+     * the local clone's authoritative tracking state was silently clobbered.
+     * The pull then computed `last == head` and exited 0 with zero output -
+     * skipping all the in-range commits the user expected to be applied.
+     *
+     * v0.6.1 fix: drop the auto-add of the fetch refspec entirely. The local
+     * clone is the AUTHORITY for its own mirror tracking state. Push to
+     * remote for backup/visibility, never auto-fetch back. Fresh clones
+     * inherit prior state via explicit `mirror bootstrap <sha>` or one-shot
+     * `git fetch <remote> 'refs/git-auto-remote/mirror/*:...'`.
+     */
+    test('does NOT auto-add the mirror fetch refspec, and does NOT silently fast-forward when remote has a newer tracking ref', async () => {
+      // Pre-state: clean baseline. Confirm no mirror fetch refspec exists.
+      const fetchRefspecsBefore = execFileSync('git', ['-C', local, 'config', '--get-all', 'remote.upstream.fetch'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+        .trim()
+        .split('\n');
+      expect(fetchRefspecsBefore).toEqual(['+refs/heads/*:refs/remotes/upstream/*']);
+
+      // Add an in-scope commit to upstream (would be applied by a normal pull).
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'packages/cli/a.ts'), 'pkg A v2 (post-bug-fix)\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'pkg: bump A (post-bug-fix)');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      const newUpstreamHead = git(local, 'rev-parse', 'upstream/main');
+
+      // Simulate: a different clone (e.g. CI) already processed this commit
+      // AND pushed its updated mirror tracking ref to upstream. So upstream's
+      // refs/git-auto-remote/mirror/upstream/last-synced now points at
+      // newUpstreamHead, while OUR local tracking ref is still at the
+      // original bootstrap point (upstream's prior tip).
+      git(upstream, 'update-ref', TRACKING_UPSTREAM, newUpstreamHead);
+
+      // Local tracking ref is still at the OLDER (bootstrap) position.
+      const trackingBefore = git(local, 'rev-parse', TRACKING_UPSTREAM);
+      expect(trackingBefore).not.toBe(newUpstreamHead);
+
+      const headBefore = git(local, 'rev-parse', 'HEAD');
+
+      // Run mirror pull. With the v0.6.1 fix, this should:
+      //   - NOT touch the fetch refspec config
+      //   - NOT clobber the local tracking ref via fetch
+      //   - process the in-range commit, applying it to HEAD
+      const code = await mirrorPull({ remote: 'upstream' });
+      expect(code).toBe(0);
+
+      // Assertion 1: fetch refspec config is unchanged - tool must not
+      // auto-add the mirror refspec.
+      const fetchRefspecsAfter = execFileSync('git', ['-C', local, 'config', '--get-all', 'remote.upstream.fetch'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+        .trim()
+        .split('\n');
+      expect(fetchRefspecsAfter).toEqual(fetchRefspecsBefore);
+      expect(fetchRefspecsAfter.some((r) => r.includes('git-auto-remote/mirror'))).toBe(false);
+
+      // Assertion 2: HEAD advanced - the commit got applied (NOT silently
+      // skipped). Pre-v0.6.1 this assertion failed: HEAD was unchanged.
+      expect(git(local, 'rev-parse', 'HEAD')).not.toBe(headBefore);
+      // The new commit's content landed.
+      expect(readFileSync(join(local, 'packages/cli/a.ts'), 'utf8')).toBe('pkg A v2 (post-bug-fix)\n');
+
+      // Assertion 3: tracking ref advanced via PROCESSING (post-applypatch
+      // hook), not via fetch clobber. Final value matches upstream head.
+      expect(git(local, 'rev-parse', TRACKING_UPSTREAM)).toBe(newUpstreamHead);
+    });
+  });
 });
