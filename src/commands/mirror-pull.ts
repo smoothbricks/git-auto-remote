@@ -9,6 +9,7 @@ import {
   printSegmentSummary,
 } from '../lib/apply.js';
 import { anyHasRegenerate, type ClassifiedCommit, classify, segment } from '../lib/classify.js';
+import { rewriteCommitterToAuthor } from '../lib/commit-rewrite.js';
 import {
   amInProgress,
   changedPaths,
@@ -234,6 +235,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   for (const seg of segments) {
     if (seg.kind === 'range') {
       printApplyingLines(seg.commits, mirror.remote);
+      const headBeforeRange = revParse('HEAD');
       setMirrorInProgress(mirror.remote);
       const result = applyRange(
         seg.commits,
@@ -258,7 +260,39 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
         return 1;
       }
       if (result === 'error') {
-        console.error(`[mirror ${mirror.remote}] Unexpected apply error.`);
+        clearMirrorInProgress();
+        // The post-applypatch hook advances the tracking ref after each
+        // successfully applied patch inside the git am batch. Read where it
+        // ended up so we know which commits landed and which one failed.
+        const currentTracking = readTrackingRef(mirror.remote);
+        let failedIdx = 0;
+        if (currentTracking) {
+          const idx = seg.commits.findIndex((c) => c.sha === currentTracking);
+          if (idx >= 0) failedIdx = idx + 1; // commit AFTER the last successful one
+        }
+
+        // Rewrite committer = author for the commits that DID land (v0.6.0
+        // invariant). Best-effort: don't let a cosmetic rewrite failure mask
+        // the real problem.
+        if (headBeforeRange && failedIdx > 0) {
+          try {
+            rewriteCommitterToAuthor(headBeforeRange, 'HEAD');
+          } catch { /* best-effort */ }
+        }
+
+        if (failedIdx > 0) {
+          console.error(`[mirror ${mirror.remote}] Applied ${failedIdx} of ${seg.commits.length} commits before error.`);
+        }
+
+        // Identify the failing commit if we can.
+        if (failedIdx < seg.commits.length) {
+          const bad = seg.commits[failedIdx];
+          const subject = commitSubject(bad.sha);
+          console.error(`[mirror ${mirror.remote}] Stopped at: ${bad.sha.slice(0, 8)}  ${subject}`);
+        }
+
+        console.error(`[mirror ${mirror.remote}]   See error output above. Re-run 'mirror pull' to retry from tracking ref.`);
+        printSegmentSummary(mirror.remote, applied, skipped, 'done');
         return 1;
       }
       // Advance tracking ref to the last commit in this range. This is the
@@ -614,7 +648,7 @@ function handlePureReview(
         GIT_COMMITTER_EMAIL: meta.authorEmail,
         GIT_COMMITTER_DATE: meta.authorDate,
       };
-      const commitResult = spawnSync('git', ['commit', '-q', '-m', meta.message], {
+      const commitResult = spawnSync('git', ['commit', '-q', '--no-verify', '-m', meta.message], {
         env,
         stdio: ['ignore', 'inherit', 'inherit'],
       });
@@ -751,7 +785,7 @@ function finalizePureReviewAsResolved(
       GIT_COMMITTER_EMAIL: meta.authorEmail,
       GIT_COMMITTER_DATE: meta.authorDate,
     };
-    const r = spawnSync('git', ['commit', '-q', '-m', meta.message], {
+    const r = spawnSync('git', ['commit', '-q', '--no-verify', '-m', meta.message], {
       env,
       stdio: ['ignore', 'inherit', 'inherit'],
     });
@@ -803,6 +837,7 @@ function printAmStopMessage(remote: string): void {
     console.error(`[mirror ${remote}]   Resolve the conflicts, git add, then one of:`);
     console.error(`    git-auto-remote mirror continue`);
     console.error(`    git-auto-remote mirror skip       # drop this commit`);
+    console.error(`    git-auto-remote mirror abort      # stop sync entirely`);
     return;
   }
   console.error(`[mirror ${remote}] Stopped structurally on ${stuckLabel}`);
@@ -810,8 +845,8 @@ function printAmStopMessage(remote: string): void {
   console.error(`[mirror ${remote}]   not present, or a mode change on a file that wasn't synced). Working tree`);
   console.error(`[mirror ${remote}]   is clean; there are no conflict markers to resolve.`);
   console.error(`    git-auto-remote mirror skip              # drop this commit and continue`);
+  console.error(`    git-auto-remote mirror abort             # stop sync entirely, rewind to retry later`);
   console.error(`    git am --show-current-patch=diff         # inspect the failing patch`);
-  console.error(`    git am --abort                           # bail out entirely`);
 }
 
 /**
@@ -904,4 +939,5 @@ function printPartialFooter(_remote: string, hasReview: boolean, sourceSha: stri
   console.error(``);
   console.error(`  Continue: git-auto-remote mirror continue`);
   console.error(`  Skip:     git-auto-remote mirror skip`);
+  console.error(`  Abort:    git-auto-remote mirror abort              # stop sync entirely, rewind to retry later`);
 }

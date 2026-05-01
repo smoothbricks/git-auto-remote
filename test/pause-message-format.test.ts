@@ -201,10 +201,10 @@ describe('pause message format (v0.5.5 regression guard)', () => {
 
     const { output } = await captureStderr(() => mirrorPull({ remote: 'upstream' }));
 
-    // Applying lines: `[mirror X] Applying: <sha8>  <subject>`
-    expect(output).toMatch(/\[mirror upstream\] Applying: [0-9a-f]{8}  pkg: bump A/);
-    expect(output).toMatch(/\[mirror upstream\] Applying: [0-9a-f]{8}  pkg: add B/);
+    // Pre-announce lines: `[mirror X] Will apply:  <sha8>  <subject>`
+    expect(output).toMatch(/\[mirror upstream\] Will apply:\s+[0-9a-f]{8}  pkg: bump A/);
+    expect(output).toMatch(/\[mirror upstream\] Will apply:\s+[0-9a-f]{8}  pkg: add B/);
     // Skipping out-of-scope line.
-    expect(output).toMatch(/\[mirror upstream\] Skipping: [0-9a-f]{8}  docs: unrelated  \(out of scope\)/);
+    expect(output).toMatch(/\[mirror upstream\] Skipping:\s+[0-9a-f]{8}  docs: unrelated  \(out of scope\)/);
   });
 });

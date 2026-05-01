@@ -104,13 +104,13 @@ afterEach(() => {
 describe('postCheckout', () => {
   describe('sets branch.<X>.pushRemote when ancestry uniquely matches one remote', () => {
     test('T1-NH-02: sets pushRemote to the remote whose history the branch descends from', () => {
-      // Create a new branch that descends from remote1's root (via cherry-pick or merge).
-      // For simplicity, we'll merge remote1/main into our local branch to create mixed ancestry.
-      // Actually, let's create a branch that descends from remote1's root by resetting to it.
       const remote1Root = git(local, 'rev-list', '--max-parents=0', 'remote1/main');
 
-      // Create a new branch based on remote1's root
-      git(local, 'checkout', '-b', 'feature-branch', remote1Root);
+      // Create branch + switch HEAD without triggering the installed post-checkout
+      // hook (git checkout -b would fire it and set pushRemote before the test).
+      git(local, 'branch', 'feature-branch', remote1Root);
+      git(local, 'symbolic-ref', 'HEAD', 'refs/heads/feature-branch');
+      git(local, 'reset', '--hard');
 
       // Verify pushRemote is not set initially
       const initialPushRemote = spawnSync('git', ['config', '--get', 'branch.feature-branch.pushRemote'], {
@@ -137,7 +137,10 @@ describe('postCheckout', () => {
   describe('no-ops when flag=0 (file checkout, not branch)', () => {
     test('T1-NH-03: returns 0 without setting pushRemote', () => {
       const remote1Root = git(local, 'rev-list', '--max-parents=0', 'remote1/main');
-      git(local, 'checkout', '-b', 'file-test-branch', remote1Root);
+      // Create branch + switch HEAD without triggering the installed post-checkout hook.
+      git(local, 'branch', 'file-test-branch', remote1Root);
+      git(local, 'symbolic-ref', 'HEAD', 'refs/heads/file-test-branch');
+      git(local, 'reset', '--hard');
 
       const prevHead = git(local, 'rev-parse', 'local-branch');
       const newHead = git(local, 'rev-parse', 'file-test-branch');

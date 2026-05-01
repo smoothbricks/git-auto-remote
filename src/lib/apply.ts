@@ -1,18 +1,23 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { rewriteCommitterToAuthor } from './commit-rewrite.js';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { closeSync, mkdirSync, openSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { amInProgress, commitSubject, gitTry, hasUnresolvedMergeConflicts, revParse } from './git.js';
 import type { ClassifiedCommit } from './classify.js';
 
 /**
  * Apply a range of clean/out-of-scope commits via `git format-patch | git am`.
  *
- *   git format-patch --stdout <sha>^..<sha> -- <syncPaths>
+ *   git format-patch --stdout <first>^..<last> -- <syncPaths>
  *      :(exclude)<excludePaths>
  *      :(exclude)<reviewPaths>
  *      :(exclude)<regeneratePaths>
- *      |  git am --empty=drop --3way
+ *      >  /tmp/patches.mbox
+ *   git am --empty=drop --3way /tmp/patches.mbox
+ *
+ * Patches are written to a temp file via fd redirection — no Node buffering,
+ * no maxBuffer limit, works for any patch size.
  *
  * Out-of-scope commits produce empty patches and are dropped by `--empty=drop`.
  * Paths matching `excludePaths`, `reviewPaths`, or `regeneratePaths` are
@@ -21,25 +26,14 @@ import type { ClassifiedCommit } from './classify.js';
  * via `applyReviewToWorktree`; regeneratePaths get (re-)produced locally by
  * `regenerateCommand` after the apply succeeds.
  *
- * IMPORTANT - why the range form `<sha>^..<sha>` rather than `-1 <sha>`:
- * `git format-patch -1 <sha> -- <pathspec>` walks BACKWARD through ancestors
- * when <sha> doesn't touch any file in the pathspec, and emits the first
- * ancestor that does. For a mirror-sync pipeline this is catastrophic: the
- * next out-of-scope commit after a just-skipped partial would silently
- * regenerate the skipped partial's patch and stream it back into `git am`,
- * leading to "am-skip doesn't advance, same commit keeps reappearing". The
- * range form `<sha>^..<sha>` anchors the walk to a single commit, so empty
- * patches stay empty. Root commits (no `^` parent) fall back to
- * `--root -1 <sha>` which has the same one-commit guarantee.
- *
- * After each invocation we verify the `From <sha>` header of the output
- * matches the SHA we asked for; any mismatch is treated as 'error' rather
- * than silently producing the wrong patches.
+ * The range form `<first>^..<last>` anchors the walk precisely; git cannot
+ * silently emit an ancestor's patch (the `-1 <sha>` footgun, see commit
+ * history). Root commits (no `^` parent) use `--root <last>`.
  *
  * @returns
  *   'applied'  - entire batch applied cleanly
  *   'conflict' - git am stopped mid-range; `.git/rebase-apply` is still present
- *   'error'    - something unexpected (git missing, malformed patch, SHA mismatch)
+ *   'error'    - something unexpected (git missing, format-patch failure, etc.)
  */
 export function applyRange(
   commits: readonly ClassifiedCommit[],
@@ -57,33 +51,57 @@ export function applyRange(
     ...regeneratePaths.map((p) => `:(exclude)${p}`),
   ];
 
-  const chunks: Buffer[] = [];
-  for (const c of commits) {
-    const chunk = formatPatchExact(c.sha, pathspec);
-    if (chunk === null) return 'error';
-    chunks.push(chunk);
-  }
-  const patchBuf = Buffer.concat(chunks);
+  // Generate patches to a temp file via fd — no Node buffering, no maxBuffer.
+  const firstSha = commits[0].sha;
+  const lastSha = commits[commits.length - 1].sha;
+  const hasParent = gitTry('rev-parse', '--verify', '--quiet', `${firstSha}^`) !== null;
+  const rangeArgs = hasParent ? [`${firstSha}^..${lastSha}`] : ['--root', lastSha];
 
-  // All patches empty (pathspec matched nothing) -> nothing to do.
-  if (patchBuf.length === 0) return 'applied';
+  const tmpPatch = join(tmpdir(), `gar-${process.pid}-${Date.now()}.mbox`);
+  let fd: number;
+  try {
+    fd = openSync(tmpPatch, 'w');
+  } catch (e) {
+    console.error(`[git-auto-remote] failed to create temp patch file: ${(e as Error).message}`);
+    return 'error';
+  }
+
+  const fpResult = spawnSync('git', ['format-patch', '--stdout', ...rangeArgs, '--', ...pathspec], {
+    stdio: ['ignore', fd, 'pipe'],
+  });
+  closeSync(fd);
+
+  if (fpResult.status !== 0) {
+    const stderr = fpResult.stderr ? fpResult.stderr.toString().trim() : '';
+    console.error(
+      `[git-auto-remote] format-patch failed (exit ${fpResult.status ?? '?'}, signal ${fpResult.signal ?? 'none'})${stderr ? ': ' + stderr : ''}`,
+    );
+    try { rmSync(tmpPatch, { force: true }); } catch { /* ignore */ }
+    return 'error';
+  }
+
+  // Empty file means pathspec matched nothing across the entire range.
+  try {
+    const size = statSync(tmpPatch).size;
+    if (size === 0) {
+      rmSync(tmpPatch, { force: true });
+      return 'applied';
+    }
+  } catch {
+    // stat failed — fall through and let git am deal with it
+  }
 
   // Capture HEAD before git am so we can rewrite just the new commits'
   // committer identities afterwards (v0.6.0 invariant: committer = author
   // across all commits this tool creates).
   const headBefore = revParse('HEAD');
 
-  const amResult = spawnSync('git', ['am', '--empty=drop', '--3way'], {
-    input: patchBuf,
-    stdio: ['pipe', 'inherit', 'inherit'],
+  const amResult = spawnSync('git', ['am', '--empty=drop', '--3way', tmpPatch], {
+    stdio: 'inherit',
   });
+  try { rmSync(tmpPatch, { force: true }); } catch { /* ignore */ }
 
   if (amResult.status === 0) {
-    // git am preserved each commit's author from the patch header, but set
-    // committer to the current git user. Rewrite committer = author for
-    // every commit in the range we just applied. Tracking ref stores
-    // SOURCE SHAs (not our local SHAs) via the post-applypatch hook, so
-    // rewriting local SHAs here does not invalidate the mirror state.
     if (headBefore) {
       try {
         rewriteCommitterToAuthor(headBefore, 'HEAD');
@@ -95,46 +113,10 @@ export function applyRange(
     return 'applied';
   }
   if (amInProgress()) return 'conflict';
+  console.error(
+    `[git-auto-remote] git am exited ${amResult.status ?? '?'} (signal ${amResult.signal ?? 'none'}) without leaving a conflict state.`,
+  );
   return 'error';
-}
-
-/**
- * Emit exactly ONE commit's patch, filtered by pathspec, without letting git's
- * pathspec-walking behavior emit an ancestor's patch when the commit itself
- * doesn't touch the pathspec.
- *
- * Returns null on git error (propagated as 'error' by the caller) or on the
- * safety-check failure (From SHA in output does not match the input SHA).
- * An empty Buffer is a valid successful return value (commit didn't touch
- * anything in pathspec).
- */
-function formatPatchExact(sha: string, pathspec: readonly string[]): Buffer | null {
-  const hasParent = gitTry('rev-parse', '--verify', '--quiet', `${sha}^`) !== null;
-  const revArgs = hasParent ? [`${sha}^..${sha}`] : ['--root', '-1', sha];
-
-  let buf: Buffer;
-  try {
-    buf = execFileSync('git', ['format-patch', '--stdout', ...revArgs, '--', ...pathspec], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-  } catch {
-    return null;
-  }
-
-  if (buf.length === 0) return buf; // empty == commit had nothing in scope, fine.
-
-  // Safety check: the patch's "From <sha>" header must match what we asked
-  // for. If it doesn't, git has walked to an ancestor somehow and we refuse
-  // to blindly pass the wrong patches into `git am`.
-  const firstLine = buf.toString('utf8', 0, Math.min(buf.length, 256)).split('\n', 1)[0];
-  const m = firstLine.match(/^From\s+([0-9a-f]{40})\s+/);
-  if (!m || m[1] !== sha) {
-    console.error(
-      `[git-auto-remote] format-patch safety: asked for ${sha.slice(0, 8)} but got ${m ? m[1].slice(0, 8) : 'no From header'} - refusing to pass mismatched patches to git am.`,
-    );
-    return null;
-  }
-  return buf;
 }
 
 /** Apply a single partial commit's in-scope (`included`) changes to HEAD. */
@@ -305,24 +287,20 @@ function writeSourceVerbatim(sha: string, paths: readonly string[]): boolean {
 }
 
 /**
- * Announce the commits about to be (or not) applied in this range. Output is
- * two-column aligned so the short SHA column is easy to scan:
- *
- *     [mirror private] Applying: abc12345  feat: add new feature
- *     [mirror private] Skipping: def67890  chore: housekeeping  (out of scope)
- *
- * The SHA makes pinpointing a stuck patch trivial - no more digging through
- * `.git/rebase-apply/` to figure out which "Applying: subject" line
- * corresponds to which commit.
+ * Pre-announce the commits about to be applied in this range. Printed before
+ * `git am` runs so the user sees the plan. Out-of-scope commits are shown as
+ * "Skipping:" (they produce empty patches dropped by `--empty=drop`).
+ * In-scope commits are shown as "Will apply:" to distinguish from git am's
+ * own "Applying:" lines that appear as each patch lands.
  */
 export function printApplyingLines(commits: readonly ClassifiedCommit[], remote: string): void {
   for (const c of commits) {
     const subject = commitSubject(c.sha);
     const shortSha = c.sha.slice(0, 8);
     if (c.classification.kind === 'out-of-scope') {
-      console.error(`[mirror ${remote}] Skipping: ${shortSha}  ${subject}  (out of scope)`);
+      console.error(`[mirror ${remote}] Skipping:    ${shortSha}  ${subject}  (out of scope)`);
     } else {
-      console.error(`[mirror ${remote}] Applying: ${shortSha}  ${subject}`);
+      console.error(`[mirror ${remote}] Will apply:  ${shortSha}  ${subject}`);
     }
   }
 }

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Command, CommanderError } from 'commander';
 import { detect } from './commands/detect.js';
+import { mirrorAbort } from './commands/mirror-abort.js';
 import { mirrorBootstrap } from './commands/mirror-bootstrap.js';
 import { mirrorContinue } from './commands/mirror-continue.js';
 import { mirrorDiff } from './commands/mirror-diff.js';
@@ -151,6 +152,11 @@ mirror
   .command('skip [remote]')
   .description('Drop the paused source commit and resume sync')
   .action(asAction((remote: string | undefined) => mirrorSkip(remote)));
+
+mirror
+  .command('abort [remote]')
+  .description('Abort mirror sync entirely; rewind tracking so next pull retries')
+  .action(asAction((remote: string | undefined) => mirrorAbort(remote)));
 
 // Passthrough commands: trailing args forwarded verbatim to git diff / git show.
 // `.passThroughOptions()` tells commander to stop option parsing at the first

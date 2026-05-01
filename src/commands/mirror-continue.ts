@@ -252,6 +252,7 @@ async function postAmTransition(remote: string, reviewState: ReviewPendingState)
   console.error(``);
   console.error(`  Continue: git-auto-remote mirror continue`);
   console.error(`  Skip:     git-auto-remote mirror skip`);
+  console.error(`  Abort:    git-auto-remote mirror abort              # stop sync entirely, rewind to retry later`);
   return 0;
 }
 
@@ -280,7 +281,7 @@ async function continueReviewPause(remote: string, reviewState: ReviewPendingSta
       GIT_COMMITTER_EMAIL: headMeta.authorEmail,
       GIT_COMMITTER_DATE: headMeta.authorDate,
     };
-    const r = spawnSync('git', ['commit', '--amend', '--no-edit'], {
+    const r = spawnSync('git', ['commit', '--amend', '--no-edit', '--no-verify'], {
       env: amendEnv,
       stdio: ['ignore', 'inherit', 'inherit'],
     });
@@ -333,7 +334,7 @@ async function continuePureReviewPause(remote: string, reviewState: ReviewPendin
       GIT_COMMITTER_EMAIL: pending.authorEmail,
       GIT_COMMITTER_DATE: pending.authorDate,
     };
-    const r = spawnSync('git', ['commit', '-q', '-m', pending.message], {
+    const r = spawnSync('git', ['commit', '-q', '--no-verify', '-m', pending.message], {
       env,
       stdio: ['ignore', 'inherit', 'inherit'],
     });

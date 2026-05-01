@@ -153,7 +153,7 @@ export function runRegenerate(
     GIT_COMMITTER_EMAIL: headMeta.authorEmail,
     GIT_COMMITTER_DATE: headMeta.authorDate,
   };
-  const amend = spawnSync('git', ['commit', '--amend', '--no-edit'], {
+  const amend = spawnSync('git', ['commit', '--amend', '--no-edit', '--no-verify'], {
     env: amendEnv,
     stdio: ['ignore', 'inherit', 'inherit'],
   });
