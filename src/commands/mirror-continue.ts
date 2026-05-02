@@ -267,28 +267,38 @@ async function postAmTransition(remote: string, reviewState: ReviewPendingState)
  * INVARIANT (v0.7.0): explicitly re-asserts the tracking ref to sourceSha
  * before tail-calling mirrorPull. Mirrors the v0.6.3 skip fix - protects
  * against external perturbation between pause and continue.
+ *
+ * INVARIANT (v0.7.2): refuse if NOTHING is staged. Pre-v0.7.2 a no-staging
+ * continue silently discarded all unstaged review leftovers and proceeded -
+ * this read like "skip review" but used `continue`, which let users hit data
+ * loss when they intended to keep something they forgot to stage. Now we
+ * force an explicit decision: stage something, or `mirror skip` to drop the
+ * source commit. (See Conloca data-loss report 2026-05-02 in test
+ * `v0.7.2: continue refuses on unstaged review-path changes`.)
  */
 async function continueReviewPause(remote: string, reviewState: ReviewPendingState): Promise<number> {
-  if (hasStagedChanges()) {
-    // Amend HEAD: --no-edit keeps author name/email, author-date, and the
-    // commit message. v0.6.0: explicitly set GIT_COMMITTER_* so committer
-    // name/email/date match author - git would otherwise refresh committer
-    // to the current user / current time.
-    const headMeta = readCommitMeta('HEAD');
-    const amendEnv = {
-      ...process.env,
-      GIT_COMMITTER_NAME: headMeta.authorName,
-      GIT_COMMITTER_EMAIL: headMeta.authorEmail,
-      GIT_COMMITTER_DATE: headMeta.authorDate,
-    };
-    const r = spawnSync('git', ['commit', '--amend', '--no-edit', '--no-verify'], {
-      env: amendEnv,
-      stdio: ['ignore', 'inherit', 'inherit'],
-    });
-    if ((r.status ?? 0) !== 0) {
-      console.error(`[mirror ${remote}] git commit --amend failed; leaving pause state intact.`);
-      return r.status ?? 1;
-    }
+  if (!hasStagedChanges()) {
+    refuseEmptyContinue(remote, reviewState);
+    return 1;
+  }
+  // Amend HEAD: --no-edit keeps author name/email, author-date, and the
+  // commit message. v0.6.0: explicitly set GIT_COMMITTER_* so committer
+  // name/email/date match author - git would otherwise refresh committer
+  // to the current user / current time.
+  const headMeta = readCommitMeta('HEAD');
+  const amendEnv = {
+    ...process.env,
+    GIT_COMMITTER_NAME: headMeta.authorName,
+    GIT_COMMITTER_EMAIL: headMeta.authorEmail,
+    GIT_COMMITTER_DATE: headMeta.authorDate,
+  };
+  const r = spawnSync('git', ['commit', '--amend', '--no-edit', '--no-verify'], {
+    env: amendEnv,
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+  if ((r.status ?? 0) !== 0) {
+    console.error(`[mirror ${remote}] git commit --amend failed; leaving pause state intact.`);
+    return r.status ?? 1;
   }
   discardReviewPaths(reviewState.review);
   // If anything else (non-review) is dirty, bail out so the user notices.
@@ -306,42 +316,51 @@ async function continueReviewPause(remote: string, reviewState: ReviewPendingSta
 }
 
 /**
- * sub-case C resume: there is no HEAD commit to amend. If the user staged any
- * review content, create a fresh commit with the source's author/date/message
- * (via GIT_AUTHOR_* env vars). Otherwise no-op (Q2a: silent skip-equivalent).
- * Tracking ref was already advanced to source SHA when the pause was entered.
+ * sub-case C resume: there is no HEAD commit to amend. The user must have
+ * staged at least one path - we then create a fresh commit with the source's
+ * author/date/message (via GIT_AUTHOR_* env vars). Tracking ref was already
+ * advanced to source SHA when the pause was entered.
  *
  * INVARIANT (v0.7.0): explicitly re-asserts the tracking ref to sourceSha
  * before tail-calling mirrorPull. Mirrors the v0.6.3 skip fix - protects
  * against external perturbation between pause and continue.
+ *
+ * INVARIANT (v0.7.2): refuse if NOTHING is staged. Pre-v0.7.2 was the
+ * documented "Q2a: silent skip-equivalent" path - which silently DROPPED
+ * the source commit when the user expected `continue` to proceed with what
+ * was visible in the worktree. Bug report: Conloca 2026-05-02. Now we force
+ * an explicit decision: stage something, or `mirror skip` to drop the source
+ * commit.
  */
 async function continuePureReviewPause(remote: string, reviewState: ReviewPendingState): Promise<number> {
+  if (!hasStagedChanges()) {
+    refuseEmptyContinue(remote, reviewState);
+    return 1;
+  }
   const pending = getPendingCommit();
-  if (hasStagedChanges()) {
-    if (!pending) {
-      console.error(
-        `[mirror ${remote}] Pure-review pause is active but pending-commit metadata is missing; refusing to guess author/date.`,
-      );
-      return 1;
-    }
-    // v0.6.0: committer = author across all commits this tool creates.
-    const env = {
-      ...process.env,
-      GIT_AUTHOR_NAME: pending.authorName,
-      GIT_AUTHOR_EMAIL: pending.authorEmail,
-      GIT_AUTHOR_DATE: pending.authorDate,
-      GIT_COMMITTER_NAME: pending.authorName,
-      GIT_COMMITTER_EMAIL: pending.authorEmail,
-      GIT_COMMITTER_DATE: pending.authorDate,
-    };
-    const r = spawnSync('git', ['commit', '-q', '--no-verify', '-m', pending.message], {
-      env,
-      stdio: ['ignore', 'inherit', 'inherit'],
-    });
-    if ((r.status ?? 0) !== 0) {
-      console.error(`[mirror ${remote}] git commit (preserved metadata) failed; leaving pause state intact.`);
-      return r.status ?? 1;
-    }
+  if (!pending) {
+    console.error(
+      `[mirror ${remote}] Pure-review pause is active but pending-commit metadata is missing; refusing to guess author/date.`,
+    );
+    return 1;
+  }
+  // v0.6.0: committer = author across all commits this tool creates.
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: pending.authorName,
+    GIT_AUTHOR_EMAIL: pending.authorEmail,
+    GIT_AUTHOR_DATE: pending.authorDate,
+    GIT_COMMITTER_NAME: pending.authorName,
+    GIT_COMMITTER_EMAIL: pending.authorEmail,
+    GIT_COMMITTER_DATE: pending.authorDate,
+  };
+  const r = spawnSync('git', ['commit', '-q', '--no-verify', '-m', pending.message], {
+    env,
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+  if ((r.status ?? 0) !== 0) {
+    console.error(`[mirror ${remote}] git commit (preserved metadata) failed; leaving pause state intact.`);
+    return r.status ?? 1;
   }
   discardReviewPaths(reviewState.review);
   if (workingTreeDirty()) {
@@ -356,6 +375,26 @@ async function continuePureReviewPause(remote: string, reviewState: ReviewPendin
   // resuming. Any external perturbation could have deleted or rewound it.
   updateTrackingRef(remote, reviewState.sourceSha);
   return mirrorPull({ remote });
+}
+
+/**
+ * v0.7.2: emit refusal guidance for `mirror continue` invoked with NOTHING
+ * staged. Pre-v0.7.2 such an invocation silently advanced tracking past the
+ * source commit, dropping it - which surprised users who expected `continue`
+ * to proceed with what was visible in the worktree. We now force the user to
+ * make an explicit choice. Shared between sub-case B and sub-case C because
+ * the guidance is identical.
+ */
+function refuseEmptyContinue(remote: string, reviewState: ReviewPendingState): void {
+  const short = reviewState.sourceSha.slice(0, 8);
+  console.error(`[mirror ${remote}] Refusing to continue with nothing staged (${short}  ${reviewState.subject}).`);
+  if (reviewState.review.length > 0) {
+    console.error(`[mirror ${remote}]   Review paths in worktree: ${reviewState.review.join(', ')}`);
+  }
+  console.error(`[mirror ${remote}]   Choose explicitly:`);
+  console.error(`    git add -p                              # stage hunks you want to keep, then re-run continue`);
+  console.error(`    git add ${reviewState.review.join(' ') || '<paths>'}   # stage everything`);
+  console.error(`    git-auto-remote mirror skip             # drop this source commit entirely`);
 }
 
 /**

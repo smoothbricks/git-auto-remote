@@ -366,20 +366,24 @@ describe('sub-case B: review-pause (mixed partial)', () => {
     expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
   });
 
-  test('continue WITHOUT staging discards unstaged review leftovers', async () => {
+  test('continue WITHOUT staging refuses (v0.7.2: forces explicit add or skip)', async () => {
+    // Pre-v0.7.2 this was a silent no-op that discarded unstaged review
+    // leftovers. v0.7.2 refuses: the pause stays intact, the user must
+    // explicitly stage hunks they want to keep or run `mirror skip`.
+    // (Behaviour change driven by Conloca data-loss report 2026-05-02.)
     await pushMixedPartial();
     await mirrorPull({ remote: 'upstream' });
 
     const headSha = git(local, 'rev-parse', 'HEAD');
 
     const code = await mirrorContinue('upstream');
-    expect(code).toBe(0);
+    expect(code).toBe(1);
 
-    // HEAD unchanged (no amend because nothing staged).
+    // Pause state intact: HEAD still at the included-subset commit, worktree
+    // still has the unstaged review content, marker not cleared.
     expect(git(local, 'rev-parse', 'HEAD')).toBe(headSha);
-    // Worktree restored to HEAD.
-    expect(readFileSync(join(local, 'packages/reviewed'), 'utf8')).toBe('reviewed v1\n');
-    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+    expect(readFileSync(join(local, 'packages/reviewed'), 'utf8')).toBe('reviewed v2\n');
+    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
   });
 
   test('skip drops the partial commit entirely and discards worktree overlay', async () => {
@@ -475,18 +479,27 @@ describe('sub-case C: pure-review-only commit', () => {
     expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
   });
 
-  test('continue WITHOUT staging is a silent no-op commit-wise (Q2a)', async () => {
-    await pushPureReviewCommit();
+  test('continue WITHOUT staging refuses (v0.7.2: was Q2a silent no-op, now explicit)', async () => {
+    // Pre-v0.7.2 (documented as "Q2a: silent skip-equivalent"): a continue
+    // with nothing staged silently advanced past source. This was the EXACT
+    // failure mode behind the Conloca data-loss report 2026-05-02 - users
+    // expected continue to proceed with what was visible in the worktree
+    // and instead lost the source commit entirely. v0.7.2 refuses; user
+    // must `git add` or `mirror skip` explicitly.
+    const sourceSha = pushPureReviewCommit();
     const headBefore = git(local, 'rev-parse', 'HEAD');
     await mirrorPull({ remote: 'upstream' });
 
     const code = await mirrorContinue('upstream');
-    expect(code).toBe(0);
+    expect(code).toBe(1);
 
+    // Pause state intact: marker present, worktree still shows source review
+    // content, tracking still at sourceSha (advanced eagerly at pause entry).
     expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
-    expect(readFileSync(join(local, 'bun.lock'), 'utf8')).toBe('locked v1\n');
-    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
-    expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(false);
+    expect(readFileSync(join(local, 'bun.lock'), 'utf8')).toBe('locked v2\n');
+    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
+    expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(true);
+    expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
   });
 
   test('skip discards worktree overlay and advances without committing', async () => {
@@ -1127,7 +1140,14 @@ describe('HIGH-5: strengthened diagnostics for continue without staging', () => 
     git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/reviewed');
   });
 
-  test('continue WITHOUT staging discards unstaged review leftovers and emits no Applying/Partial lines', async () => {
+  test('continue WITHOUT staging refuses cleanly without spurious mirrorPull output (v0.7.2)', async () => {
+    // Pre-v0.7.2 this test asserted that continue silently discarded
+    // leftovers AND that mirrorPull's tail-call emitted no "Applying:" /
+    // "Partial:" lines on the now-tracked commit. v0.7.2 makes the refusal
+    // explicit; mirrorPull is never tail-called, so the no-spurious-output
+    // assertion is now trivially satisfied. The diagnostic value of the
+    // assertion (catch a regression where continue advances tracking AND
+    // re-runs the loop) remains useful.
     await pushMixedPartial();
     await mirrorPull({ remote: 'upstream' });
 
@@ -1146,15 +1166,217 @@ describe('HIGH-5: strengthened diagnostics for continue without staging', () => 
     // Restore stderr
     process.stderr.write = originalStderr;
 
-    expect(code).toBe(0);
+    expect(code).toBe(1);
+    // Pause state intact.
     expect(git(local, 'rev-parse', 'HEAD')).toBe(headSha);
-    expect(readFileSync(join(local, 'packages/reviewed'), 'utf8')).toBe('reviewed v1\n');
-    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+    expect(readFileSync(join(local, 'packages/reviewed'), 'utf8')).toBe('reviewed v2\n');
+    expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
 
-    // Assert no "Applying:" or "Partial:" lines in stderr (these indicate
-    // spurious mirrorPull activity on the just-continued commit)
+    // The refusal must NOT have advanced into mirrorPull (which would print
+    // "Applying:" / "Partial:" headers for the next commit). Refusal is a
+    // pure return-1 path. (Bun's stderr-capture path doesn't see
+    // console.error, so this captures only direct process.stderr.write -
+    // good enough for the regression intent.)
     const stderr = stderrChunks.join('');
     expect(stderr).not.toContain('Applying:');
     expect(stderr).not.toContain('Partial:');
+  });
+});
+
+/**
+ * v0.7.2 (Conloca data-loss bug, 2026-05-02): Pre-v0.7.2 `mirror continue`
+ * during `pure-review-pause` with NO staged changes silently advanced the
+ * tracking ref past the source commit and DROPPED IT from the local history.
+ * The user thought they were proceeding with what they had reviewed; instead
+ * the entire commit was skipped without warning.
+ *
+ * The pre-v0.7.2 contract said "no staging = silent skip-equivalent (Q2a)".
+ * The v0.7.2 contract: continue refuses if any review path has unstaged
+ * changes in the worktree. The user must either stage what they want to keep
+ * (`git add -p`), explicitly discard hunks (`git restore`), or run `mirror
+ * skip` to drop the source commit.
+ *
+ * This applies to BOTH pause sub-cases:
+ *   - sub-case B (`review-pause`): HEAD has the included subset; an unstaged
+ *     review path means the user hasn't decided whether to roll it into the
+ *     amended commit yet.
+ *   - sub-case C (`pure-review-pause`): no HEAD commit exists yet; an unstaged
+ *     review path means a commit hasn't been formed.
+ */
+describe('v0.7.2: continue refuses on unstaged review-path changes', () => {
+  describe('sub-case C (pure-review-pause)', () => {
+    function pushPureReviewCommit(): string {
+      writeFileSync(join(local, 'bun.lock'), 'locked v1\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'local: seed bun.lock');
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'bun.lock'), 'locked v1\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'upstream: seed bun.lock');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+
+      writeFileSync(join(seed, 'bun.lock'), 'locked v2\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'chore: bump bun.lock');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      return git(seed, 'rev-parse', 'HEAD');
+    }
+
+    beforeEach(() => {
+      git(local, 'config', 'auto-remote.upstream.reviewPaths', 'bun.lock');
+    });
+
+    test('continue with unstaged review changes refuses (exit 1) and preserves pause state', async () => {
+      const sourceSha = pushPureReviewCommit();
+      const headBefore = git(local, 'rev-parse', 'HEAD');
+      await mirrorPull({ remote: 'upstream' });
+
+      // Confirm the pause-time invariant: bun.lock is in the worktree
+      // unstaged with source's v2 content; nothing is staged. Note: the
+      // test `git()` helper trims output so the leading space of the porcelain
+      // " M" code is gone - match on the trimmed form.
+      expect(readFileSync(join(local, 'bun.lock'), 'utf8')).toBe('locked v2\n');
+      const statusBefore = git(local, 'status', '--porcelain');
+      expect(statusBefore).toBe('M bun.lock'); // " M bun.lock" trimmed -> "M bun.lock"
+
+      // The bug repro: user runs `mirror continue` thinking it'll proceed
+      // with whatever's in the worktree. v0.7.2 must refuse, NOT silently
+      // advance tracking.
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(1);
+
+      // Pause state INTACT - tracking still at sourceSha, marker still
+      // present, worktree still has the unstaged review content. User can
+      // now stage what they want or run `mirror skip`.
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+      expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
+      expect(existsSync(join(local, '.git/git-auto-remote/pending-commit'))).toBe(true);
+      expect(readFileSync(join(local, 'bun.lock'), 'utf8')).toBe('locked v2\n');
+    });
+
+    test('continue after staging review content commits with source metadata (existing behaviour)', async () => {
+      const sourceSha = pushPureReviewCommit();
+      await mirrorPull({ remote: 'upstream' });
+
+      git(local, 'add', 'bun.lock');
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // Commit with source's metadata landed.
+      expect(git(local, 'show', '-s', '--format=%s', 'HEAD')).toBe('chore: bump bun.lock');
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+    });
+
+    test('continue after `git restore` (clean worktree, nothing staged) refuses with skip guidance', async () => {
+      // The user's other valid path: explicitly discard the review overlay
+      // first. v0.7.2 still refuses because the user's intent here is
+      // ambiguous - they may have meant to skip but used continue. Direct
+      // them to `mirror skip` for an explicit discard.
+      const sourceSha = pushPureReviewCommit();
+      await mirrorPull({ remote: 'upstream' });
+
+      git(local, 'restore', 'bun.lock');
+      // Worktree is now clean.
+      expect(git(local, 'status', '--porcelain')).toBe('');
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(1);
+
+      // Pause state still intact.
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+    });
+  });
+
+  describe('sub-case B (review-pause: included subset already on HEAD)', () => {
+    function pushMixedPartial(): string {
+      writeFileSync(join(local, 'packages/reviewed'), 'reviewed v1\n');
+      git(local, 'add', '-A');
+      git(local, 'commit', '-q', '-m', 'local: seed reviewed');
+      const seed = join(root, 'seed');
+      writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v1\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'upstream: seed reviewed');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      git(local, 'update-ref', TRACKING, git(local, 'rev-parse', 'upstream/main'));
+
+      writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2 upstream\n');
+      writeFileSync(join(seed, 'packages/reviewed'), 'reviewed v2\n');
+      git(seed, 'add', '-A');
+      git(seed, 'commit', '-q', '-m', 'feat: bump A + reviewed');
+      git(seed, 'push', '-q', 'origin', 'main');
+      git(local, 'fetch', '-q', 'upstream');
+      return git(seed, 'rev-parse', 'HEAD');
+    }
+
+    beforeEach(() => {
+      git(local, 'config', 'auto-remote.upstream.reviewPaths', 'packages/reviewed');
+    });
+
+    test('continue with unstaged review changes refuses (exit 1) and preserves pause state', async () => {
+      const sourceSha = pushMixedPartial();
+      await mirrorPull({ remote: 'upstream' });
+
+      // Pause-time invariant: included subset (packages/cli/a.ts) is on HEAD,
+      // packages/reviewed is in worktree unstaged. Test helper trims output;
+      // " M packages/reviewed" trims to "M packages/reviewed".
+      const headAtPause = git(local, 'rev-parse', 'HEAD');
+      const statusBefore = git(local, 'status', '--porcelain');
+      expect(statusBefore).toBe('M packages/reviewed');
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(1);
+
+      // Pause state intact.
+      expect(git(local, 'rev-parse', 'HEAD')).toBe(headAtPause);
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
+      // Worktree still has the unstaged review content.
+      expect(readFileSync(join(local, 'packages/reviewed'), 'utf8')).toBe('reviewed v2\n');
+    });
+
+    test('continue after staging review content amends HEAD (existing behaviour)', async () => {
+      const sourceSha = pushMixedPartial();
+      await mirrorPull({ remote: 'upstream' });
+
+      git(local, 'add', 'packages/reviewed');
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(0);
+
+      // Amended commit has both files.
+      const files = git(local, 'show', '--name-only', '--format=', 'HEAD').split('\n').filter(Boolean).sort();
+      expect(files).toEqual(['packages/cli/a.ts', 'packages/reviewed'].sort());
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(false);
+    });
+
+    test('continue after `git restore` (worktree clean, nothing staged) refuses with skip guidance', async () => {
+      // v0.7.2: even though sub-case B has the included subset on HEAD
+      // already, accepting the continue with NO staged amend is an
+      // empty-amend (no-op commit-wise). User intent is ambiguous - they
+      // may have meant `mirror skip` (drop the source commit entirely) or
+      // they may have meant to keep something they forgot to stage. Refuse
+      // and force an explicit decision.
+      const sourceSha = pushMixedPartial();
+      await mirrorPull({ remote: 'upstream' });
+      const headAtPause = git(local, 'rev-parse', 'HEAD');
+
+      git(local, 'restore', 'packages/reviewed');
+      expect(git(local, 'status', '--porcelain')).toBe('');
+
+      const code = await mirrorContinue('upstream');
+      expect(code).toBe(1);
+
+      // Pause state intact - user has to choose explicitly.
+      expect(git(local, 'rev-parse', 'HEAD')).toBe(headAtPause);
+      expect(git(local, 'rev-parse', TRACKING)).toBe(sourceSha);
+      expect(existsSync(join(local, '.git/git-auto-remote/review-pending'))).toBe(true);
+    });
   });
 });

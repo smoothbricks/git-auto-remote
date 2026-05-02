@@ -77,6 +77,7 @@ After resume, the loop re-enters `mirror pull` automatically and processes the n
 - `v0.6.2` — commander CLI + per-subcommand `--help` + strict flag parsing + cross-direction-leak warnings.
 - `v0.6.3` — `mirror skip` always advances tracking ref (CRIT-1 of audit).
 - `v0.7.0` — full audit-driven hardening: continue paths (CRIT-1), HEAD-contains-included-subset verification (CRIT-2), merge-in-progress + stale-sentinel + version-skew guards on `mirror pull`, hook entry-point integration tests.
+- `v0.7.2` — `mirror continue` now refuses when nothing is staged (was silent skip-equivalent / "Q2a"). Pre-v0.7.2 a continue with unstaged review leftovers silently advanced tracking past the source commit, dropping it - reproduced as a Conloca data-loss report (2026-05-02). New contract: stage what you want or `mirror skip` explicitly.
 
 ## Test harness
 
