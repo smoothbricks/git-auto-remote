@@ -16,6 +16,7 @@ export type HandlerInput = {
   sourceSubject: string;
   includedPaths: readonly string[];
   reviewPaths: readonly string[];
+  regeneratePaths: readonly string[];
   outsidePaths: readonly string[];
 };
 
@@ -40,6 +41,7 @@ export function runPartialHandler(handlerCmd: string, input: HandlerInput): Hand
     MIRROR_SOURCE_SUBJECT: input.sourceSubject,
     MIRROR_INCLUDED_PATHS: input.includedPaths.join('\n'),
     MIRROR_REVIEW_PATHS: input.reviewPaths.join('\n'),
+    MIRROR_REGENERATE_PATHS: input.regeneratePaths.join('\n'),
     MIRROR_OUTSIDE_PATHS: input.outsidePaths.join('\n'),
   };
 

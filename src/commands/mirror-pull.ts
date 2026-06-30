@@ -580,6 +580,7 @@ async function handlePartial(
       sourceSubject: subject,
       includedPaths: included,
       reviewPaths: review,
+      regeneratePaths: regenerate,
       outsidePaths: outside,
     });
     if (outcome === 'resolved') {
@@ -760,6 +761,7 @@ function handlePureReview(
       sourceSubject: subject,
       includedPaths: [],
       reviewPaths: review,
+      regeneratePaths: regenerate,
       outsidePaths: outside,
     });
     if (outcome === 'resolved') {
