@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { git, gitTry } from './git.js';
 
@@ -23,9 +23,7 @@ export type MirrorConfig = {
   regeneratePaths: readonly string[];
   /**
    * Shell command (run via `sh -c`) that produces `regeneratePaths` from current sources.
-   * For nix/devenv-based repos whose tools live inside a project env, wrap accordingly:
-   *   regenerateCommand = devenv shell -c 'bun i && bun run nx sync'
-   * so `bun`/`nx` resolve to the pinned versions regardless of the PATH git inherited.
+   * Runs after each apply when the source commit touched any regeneratePaths. Null = none.
    */
   regenerateCommand: string | null;
   /** Branch on the mirror to pull from. Default: the remote's HEAD branch, or 'main'. */
@@ -41,41 +39,94 @@ export type MirrorConfig = {
   pushSyncRef: boolean;
 };
 
+/** Git lower-cases the final key segment on storage. */
+const MIRROR_KEY_RE = '^auto-remote\\..+\\.(syncpaths|syncpathsfile)';
+
+/**
+ * Resolve the committed mirror-config file, if any. A repo can ship its
+ * `[auto-remote "..."]` sections in a worktree file so a fresh CI clone (or an
+ * agent in a blank session) recognizes its mirrors WITHOUT a host-specific
+ * bootstrap that stamps `.git/config`. Resolution order:
+ *
+ *   1. `git config auto-remote.configFile <path>` (relative to repo root, or absolute)
+ *   2. repo-root `auto-remote.gitconfig`
+ *   3. `tooling/auto-remote.gitconfig`
+ *
+ * Returns an absolute path to an existing file, or null when none is present.
+ * An explicit `configFile` that points at a missing file is a hard error - a
+ * misconfiguration we surface loudly rather than silently treating the repo as
+ * having no mirrors.
+ */
+export function committedConfigPath(): string | null {
+  const root = gitTry('rev-parse', '--show-toplevel');
+
+  const explicit = gitTry('config', '--get', 'auto-remote.configFile');
+  if (explicit) {
+    const full = isAbsolute(explicit) ? explicit : root ? join(root, explicit) : explicit;
+    if (!existsSync(full)) {
+      throw new Error(
+        `auto-remote.configFile points at '${explicit}' but that file does not exist (resolved to '${full}'). ` +
+          `Create the committed config file or unset the key: git config --unset auto-remote.configFile`,
+      );
+    }
+    return full;
+  }
+
+  if (!root) return null;
+  for (const rel of ['auto-remote.gitconfig', 'tooling/auto-remote.gitconfig']) {
+    const candidate = join(root, rel);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Read a key with committed-file fallback: standard `git config` wins, the
+ * committed file fills in anything the host has not overridden.
+ */
+function mergedGet(committed: string | null, key: string): string | null {
+  const standard = gitTry('config', '--get', key);
+  if (standard !== null) return standard;
+  return committed ? gitTry('config', '--file', committed, '--get', key) : null;
+}
+
+/** Collect remote names whose syncpaths/syncpathsfile key appears in `getRegexpOut`. */
+function collectMirrorRemotes(getRegexpOut: string | null, into: Set<string>): void {
+  if (!getRegexpOut) return;
+  for (const line of getRegexpOut.split('\n')) {
+    const match = line.match(/^auto-remote\.(.+)\.(syncpaths|syncpathsfile)\s/i);
+    if (match) into.add(match[1]);
+  }
+}
+
 /** List all remotes that are configured as mirrors (have syncPaths or syncPathsFile set). */
 export function listMirrorConfigs(): MirrorConfig[] {
-  // Git lower-cases the final key segment on storage.
-  const out = gitTry('config', '--get-regexp', '^auto-remote\\..+\\.(syncpaths|syncpathsfile)');
-  if (!out) return [];
+  const committed = committedConfigPath();
   const remotes = new Set<string>();
-  for (const line of out.split('\n')) {
-    const match = line.match(/^auto-remote\.(.+)\.(syncpaths|syncpathsfile)\s/i);
-    if (match) remotes.add(match[1]);
-  }
-  return [...remotes]
-    .map((r) => getMirrorConfig(r))
-    .filter((c): c is MirrorConfig => c !== null);
+  collectMirrorRemotes(gitTry('config', '--get-regexp', MIRROR_KEY_RE), remotes);
+  if (committed) collectMirrorRemotes(gitTry('config', '--file', committed, '--get-regexp', MIRROR_KEY_RE), remotes);
+  return [...remotes].map((r) => getMirrorConfig(r)).filter((c): c is MirrorConfig => c !== null);
 }
 
 export function getMirrorConfig(remote: string): MirrorConfig | null {
-  const syncPaths = readPathList(remote, 'syncPaths');
+  const committed = committedConfigPath();
+
+  const syncPaths = readPathList(remote, 'syncPaths', committed);
   if (syncPaths.length === 0) return null;
 
-  const excludePaths = readPathList(remote, 'excludePaths');
-  const reviewPaths = readPathList(remote, 'reviewPaths');
-  const regeneratePaths = readPathList(remote, 'regeneratePaths');
-  const regenerateCommand = gitTry('config', '--get', `auto-remote.${remote}.regenerateCommand`);
+  const excludePaths = readPathList(remote, 'excludePaths', committed);
+  const reviewPaths = readPathList(remote, 'reviewPaths', committed);
+  const regeneratePaths = readPathList(remote, 'regeneratePaths', committed);
+  const regenerateCommand = mergedGet(committed, `auto-remote.${remote}.regenerateCommand`);
 
   const syncBranch =
-    gitTry('config', '--get', `auto-remote.${remote}.syncBranch`) ??
-    detectRemoteHead(remote) ??
-    'main';
+    mergedGet(committed, `auto-remote.${remote}.syncBranch`) ?? detectRemoteHead(remote) ?? 'main';
 
-  const syncTargetBranch =
-    gitTry('config', '--get', `auto-remote.${remote}.syncTargetBranch`) ?? remote;
+  const syncTargetBranch = mergedGet(committed, `auto-remote.${remote}.syncTargetBranch`) ?? remote;
 
-  const partialHandler = gitTry('config', '--get', `auto-remote.${remote}.partialHandler`);
+  const partialHandler = mergedGet(committed, `auto-remote.${remote}.partialHandler`);
 
-  const pushSyncRefRaw = gitTry('config', '--get', `auto-remote.${remote}.pushSyncRef`);
+  const pushSyncRefRaw = mergedGet(committed, `auto-remote.${remote}.pushSyncRef`);
   const pushSyncRef = pushSyncRefRaw === null ? true : pushSyncRefRaw !== 'false';
 
   return {
@@ -93,21 +144,22 @@ export function getMirrorConfig(remote: string): MirrorConfig | null {
 }
 
 /**
- * Read a path list from git config, merging inline `auto-remote.X.<key>`
- * (whitespace-split) and file-referenced `auto-remote.X.<key>File`
- * (newline-separated with # comments, like .gitignore).
+ * Read a path list, merging inline `auto-remote.X.<key>` (whitespace-split)
+ * and file-referenced `auto-remote.X.<key>File` (newline-separated with #
+ * comments, like .gitignore). Both the inline key and the file key prefer a
+ * standard `git config` value, falling back to the committed config file.
  */
-function readPathList(remote: string, key: string): string[] {
+function readPathList(remote: string, key: string, committed: string | null): string[] {
   const paths: string[] = [];
 
-  const inline = gitTry('config', '--get', `auto-remote.${remote}.${key}`);
+  const inline = mergedGet(committed, `auto-remote.${remote}.${key}`);
   if (inline) {
     for (const p of inline.split(/\s+/)) {
       if (p.length > 0) paths.push(p);
     }
   }
 
-  const filePath = gitTry('config', '--get', `auto-remote.${remote}.${key}File`);
+  const filePath = mergedGet(committed, `auto-remote.${remote}.${key}File`);
   if (filePath) {
     for (const p of readPathsFile(filePath)) paths.push(p);
   }
@@ -124,6 +176,11 @@ function readPathsFile(filePath: string): string[] {
   const root = git('rev-parse', '--show-toplevel');
   // v0.7.0 MEDIUM-3 (see 2026-04-18-audit.md): Support absolute paths directly
   const full = isAbsolute(filePath) ? filePath : join(root, filePath);
+  if (!existsSync(full)) {
+    throw new Error(
+      `syncPathsFile/excludePathsFile/... points at '${filePath}' but that file does not exist (resolved to '${full}').`,
+    );
+  }
   const content = readFileSync(full, 'utf8');
   const out: string[] = [];
   for (const rawLine of content.split('\n')) {
