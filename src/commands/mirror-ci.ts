@@ -103,10 +103,16 @@ async function ciOne(mirror: MirrorConfig, options: MirrorCiOptions): Promise<nu
   return 0;
 }
 
-/** Push the synced target branch to `<remote>[:<dstref>]` (plain, non-forced). */
+/**
+ * Push the synced target branch to `<remote>[:<dstref>]` (plain, non-forced).
+ * `--no-verify`: this is a sanctioned self-push by `mirror ci` of the branch it
+ * just synced; gar's own pre-push cross-history guard must not block it. The
+ * guard stays active for everything else (notably the public-facing push the
+ * consuming workflow performs).
+ */
 function pushBranch(branch: string, spec: string): boolean {
   const colon = spec.indexOf(':');
   const remote = colon < 0 ? spec : spec.slice(0, colon);
   const dst = colon < 0 ? `refs/heads/${branch}` : spec.slice(colon + 1);
-  return gitTry('push', '--quiet', remote, `refs/heads/${branch}:${dst}`) !== null;
+  return gitTry('push', '--quiet', '--no-verify', remote, `refs/heads/${branch}:${dst}`) !== null;
 }
