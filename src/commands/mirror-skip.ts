@@ -9,6 +9,7 @@ import {
   updateTrackingRef,
 } from '../lib/mirror-state.js';
 import { mirrorPull } from './mirror-pull.js';
+import { printNext } from '../lib/guidance.js';
 
 /**
  * Unified skip command across all pause sub-cases.
@@ -45,6 +46,7 @@ export async function mirrorSkip(remoteArg?: string): Promise<number> {
   const review = getReviewPending();
   if (!review) {
     console.error(`[git-auto-remote] Nothing to skip (no active sync pause).`);
+    printNext('git-auto-remote mirror pull', 'no pause to resume - start/refresh a sync (or mirror status to diagnose)');
     return 1;
   }
   const remote = remoteArg ?? review.remote;

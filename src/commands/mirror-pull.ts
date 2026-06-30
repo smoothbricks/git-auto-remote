@@ -48,6 +48,7 @@ import {
   updateTrackingRef,
 } from '../lib/mirror-state.js';
 import { VERSION } from '../lib/version.js';
+import { printNext } from '../lib/guidance.js';
 
 export type MirrorPullOptions = {
   /** Target remote; if omitted, run for every configured mirror in turn. */
@@ -117,6 +118,7 @@ export async function mirrorPull(options: MirrorPullOptions): Promise<number> {
   if (options.remote && mirrors.length === 0) {
     console.error(`[git-auto-remote] No mirror configured for remote '${options.remote}'.`);
     console.error(`  Configure with: git config auto-remote.${options.remote}.syncPaths "<paths>"`);
+    printNext('git-auto-remote mirror status', 'no mirror config found - check committed auto-remote.gitconfig or git config');
     return 1;
   }
 
@@ -262,6 +264,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   }
   if (last === head) {
     // Up to date; nothing to say.
+    printNext('git-auto-remote mirror status', 'already up to date; nothing to sync');
     return 0;
   }
   if (last && !isAncestorOf(last, head)) {
@@ -474,6 +477,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   if (applied > 0 || skipped > 0) {
     printSegmentSummary(mirror.remote, applied, skipped, 'done');
   }
+  printNext('git-auto-remote mirror status', 'confirm the sync advanced; push the target branch when ready');
   return 0;
 }
 
@@ -971,6 +975,7 @@ function printAmStopMessage(remote: string): void {
     console.error(`    git-auto-remote mirror continue`);
     console.error(`    git-auto-remote mirror skip       # drop this commit`);
     console.error(`    git-auto-remote mirror abort      # stop sync entirely`);
+    printNext('git-auto-remote mirror continue', 'resolve the conflict markers + git add, then resume (or mirror skip / abort)');
     return;
   }
   console.error(`[mirror ${remote}] Stopped structurally on ${stuckLabel}`);
@@ -980,6 +985,7 @@ function printAmStopMessage(remote: string): void {
   console.error(`    git-auto-remote mirror skip              # drop this commit and continue`);
   console.error(`    git-auto-remote mirror abort             # stop sync entirely, rewind to retry later`);
   console.error(`    git am --show-current-patch=diff         # inspect the failing patch`);
+  printNext('git-auto-remote mirror skip', 'drop this structurally-unappliable commit and continue (or mirror abort)');
 }
 
 /**
@@ -1073,4 +1079,5 @@ function printPartialFooter(_remote: string, hasReview: boolean, sourceSha: stri
   console.error(`  Continue: git-auto-remote mirror continue`);
   console.error(`  Skip:     git-auto-remote mirror skip`);
   console.error(`  Abort:    git-auto-remote mirror abort              # stop sync entirely, rewind to retry later`);
+  printNext('git-auto-remote mirror continue', 'stage the review (git add -p) then resume, or mirror skip to drop this commit');
 }

@@ -20,6 +20,7 @@ import { prePush } from './commands/pre-push.js';
 import { setup } from './commands/setup.js';
 import { status } from './commands/status.js';
 import { uninstall } from './commands/uninstall.js';
+import { formatNext } from './lib/guidance.js';
 
 const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')) as {
   version: string;
@@ -30,9 +31,18 @@ const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', imp
  * Commander swallows return values, so we translate non-zero codes into
  * process.exit(). Errors thrown inside bubble up to the top-level catch.
  */
-function asAction<Args extends unknown[]>(fn: (...args: Args) => number | Promise<number>) {
+type NextHint = (code: number) => { command: string; why: string } | null;
+
+function asAction<Args extends unknown[]>(
+  fn: (...args: Args) => number | Promise<number>,
+  nextHint?: NextHint,
+) {
   return async (...args: Args) => {
     const code = await fn(...args);
+    if (nextHint) {
+      const hint = nextHint(code);
+      if (hint) console.error(`\n${formatNext(hint.command, hint.why)}`);
+    }
     if (code !== 0) process.exit(code);
   };
 }
@@ -45,28 +55,92 @@ const program = new Command()
   // to forward trailing flags (`--stat`, `--name-only`, ...) verbatim to git.
   .enablePositionalOptions();
 
+program.addHelpText(
+  'after',
+  `
+Typical agent workflow:
+  1. git-auto-remote setup                     # install chainable hooks (idempotent)
+  2. git-auto-remote mirror status             # diagnose config + tracking + remediation
+  3. git-auto-remote mirror ci <remote>        # one-shot self-healing CI sync per direction
+       exit 0 = synced   exit 2 = review PR needed   exit 1 = hard error
+  4. on exit 2: push refs/heads/gar-sync/<dir> to your PR remote, open/refresh ONE PR
+Every command ends with a 'Next:' line naming the exact command to run next.
+`,
+);
+
 // --- Core commands ----------------------------------------------------------
 
 program
   .command('setup')
   .description('Install chainable git hooks (idempotent)')
   .option('--quiet', 'Suppress informational output (still prints errors)')
-  .action(asAction((opts: { quiet?: boolean }) => setup({ quiet: !!opts.quiet })));
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote setup                    # install/refresh chainable hooks
+`,
+  )
+  .action(
+    asAction(
+      (opts: { quiet?: boolean }) => setup({ quiet: !!opts.quiet }),
+      (code) =>
+        code === 0
+          ? { command: 'git-auto-remote mirror status', why: 'check config + tracking, then mirror ci <remote> to sync' }
+          : { command: 'git-auto-remote setup', why: 'upgrade git to a supported version, then re-run' },
+    ),
+  );
 
 program
   .command('status')
   .description("Show the current branch's auto-routing decision and any cross-history conflicts")
-  .action(asAction(() => status()));
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote status                   # routing decision for the current branch
+`,
+  )
+  .action(
+    asAction(
+      () => status(),
+      () => ({ command: 'git-auto-remote mirror status', why: 'inspect mirror sync state + remediation' }),
+    ),
+  );
 
 program
   .command('detect [ref]')
   .description('Run ancestry analysis for a ref (default: HEAD)')
-  .action(asAction((ref: string | undefined) => detect(ref)));
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote detect HEAD              # which remote's history HEAD descends from
+`,
+  )
+  .action(
+    asAction(
+      (ref: string | undefined) => detect(ref),
+      () => ({ command: 'git-auto-remote status', why: 'see the routing decision applied to your branch' }),
+    ),
+  );
 
 program
   .command('uninstall')
   .description('Remove git-auto-remote marker block from .git/hooks/* (other content preserved)')
-  .action(asAction(() => uninstall()));
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote uninstall                # remove our hook blocks (keeps other hook content)
+`,
+  )
+  .action(
+    asAction(
+      () => uninstall(),
+      () => ({ command: 'git-auto-remote setup', why: 'reinstall hooks if that removal was unintended' }),
+    ),
+  );
 
 // --- Mirror commands --------------------------------------------------------
 
@@ -79,7 +153,19 @@ const mirror = program
 mirror
   .command('list')
   .description('List all configured mirror remotes with their full config')
-  .action(asAction(() => mirrorList()));
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote mirror list              # full config for every configured mirror
+`,
+  )
+  .action(
+    asAction(
+      () => mirrorList(),
+      () => ({ command: 'git-auto-remote mirror status', why: 'sync state + remediation per mirror' }),
+    ),
+  );
 
 mirror
   .command('status [remote]')
@@ -117,7 +203,13 @@ See README "Tracking-ref durability > SECURITY".
 `,
   )
   .action(
-    asAction((remote: string, sha: string, opts: { force?: boolean }) => mirrorBootstrap(remote, sha, !!opts.force)),
+    asAction(
+      (remote: string, sha: string, opts: { force?: boolean }) => mirrorBootstrap(remote, sha, !!opts.force),
+      (code) =>
+        code === 0
+          ? { command: 'git-auto-remote mirror pull', why: 'replay new commits onto the target branch' }
+          : { command: 'git-auto-remote mirror status', why: 'inspect config + tracking, fix, then re-run bootstrap' },
+    ),
   );
 
 mirror
@@ -193,17 +285,43 @@ Next on exit 2: push the review ref to your PR-hosting remote and open/refresh
 mirror
   .command('continue [remote]')
   .description('Resume mirror sync from any paused state')
+  .addHelpText(
+    'after',
+    `
+Example:
+  git add -p && git-auto-remote mirror continue   # stage the review, then resume the sync
+`,
+  )
   .action(asAction((remote: string | undefined) => mirrorContinue(remote)));
 
 mirror
   .command('skip [remote]')
   .description('Drop the paused source commit and resume sync')
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote mirror skip              # drop the paused source commit, advance, resume
+`,
+  )
   .action(asAction((remote: string | undefined) => mirrorSkip(remote)));
 
 mirror
   .command('abort [remote]')
   .description('Abort mirror sync entirely; rewind tracking so next pull retries')
-  .action(asAction((remote: string | undefined) => mirrorAbort(remote)));
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote mirror abort             # stop the sync, rewind tracking to retry later
+`,
+  )
+  .action(
+    asAction(
+      (remote: string | undefined) => mirrorAbort(remote),
+      () => ({ command: 'git-auto-remote mirror pull', why: 're-run to retry from the rewound tracking ref' }),
+    ),
+  );
 
 // Passthrough commands: trailing args forwarded verbatim to git diff / git show.
 // `.passThroughOptions()` tells commander to stop option parsing at the first
@@ -219,18 +337,40 @@ mirror
   .description('Source-vs-HEAD diff during a pause (scoped to review bucket)')
   .option('--raw', 'Bypass review-bucket pathspec; raw git diff HEAD <source>')
   .passThroughOptions()
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote mirror diff              # what the source changed that hasn't landed in HEAD
+`,
+  )
   .action(
-    asAction((remote: string | undefined, gitArgs: string[], opts: { raw?: boolean }) => {
-      const extra = opts.raw ? ['--raw', ...gitArgs] : gitArgs;
-      return mirrorDiff(remote, extra);
-    }),
+    asAction(
+      (remote: string | undefined, gitArgs: string[], opts: { raw?: boolean }) => {
+        const extra = opts.raw ? ['--raw', ...gitArgs] : gitArgs;
+        return mirrorDiff(remote, extra);
+      },
+      () => ({ command: 'git-auto-remote mirror continue', why: 'stage what you want (git add -p) then resume, or mirror skip' }),
+    ),
   );
 
 mirror
   .command('source [remote] [git-args...]')
   .description("'git show' the current pause's source commit")
   .passThroughOptions()
-  .action(asAction((remote: string | undefined, gitArgs: string[]) => mirrorSource(remote, gitArgs)));
+  .addHelpText(
+    'after',
+    `
+Example:
+  git-auto-remote mirror source            # full 'git show' of the paused source commit
+`,
+  )
+  .action(
+    asAction(
+      (remote: string | undefined, gitArgs: string[]) => mirrorSource(remote, gitArgs),
+      () => ({ command: 'git-auto-remote mirror diff', why: 'see what the source changed that has not landed in HEAD' }),
+    ),
+  );
 
 // --- Hook entry points (invoked by installed hooks) -------------------------
 

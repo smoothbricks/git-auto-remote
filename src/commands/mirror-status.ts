@@ -1,7 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { amInProgress, configGetAll, currentBranch, gitTry, isAncestorOf, listCommitsInRange, revParse } from '../lib/git.js';
 import { getMirrorConfig, listMirrorConfigs } from '../lib/mirror-config.js';
-import { getReviewPending, readTrackingRef } from '../lib/mirror-state.js';
+import { getMirrorInProgress, getReviewPending, readTrackingRef } from '../lib/mirror-state.js';
+import { getInstalledHookVersion } from '../lib/hooks.js';
+import { VERSION } from '../lib/version.js';
+import { printNext } from '../lib/guidance.js';
 
 /**
  * Show the local mirror state for one or all configured mirrors.
@@ -22,6 +25,12 @@ export function mirrorStatus(remoteArg?: string, options: { showRemotes?: boolea
 
   if (mirrors.length === 0) {
     console.log(remoteArg ? `No mirror configured for '${remoteArg}'.` : 'No mirrors configured.');
+    console.error('  Configure a mirror via a committed auto-remote.gitconfig at the repo root, or:');
+    console.error(`    git config auto-remote.${remoteArg ?? '<remote>'}.syncPaths "<paths>"`);
+    printNext(
+      `git config auto-remote.${remoteArg ?? '<remote>'}.syncPaths "<paths>"`,
+      'configure a mirror, then re-run mirror status',
+    );
     return 0;
   }
 
@@ -36,10 +45,19 @@ export function mirrorStatus(remoteArg?: string, options: { showRemotes?: boolea
   }
   console.log('');
 
+  // C1-h: collect actionable problems for the remediation section below.
+  const issues: { problem: string; fix: string }[] = [];
+
   for (let i = 0; i < mirrors.length; i++) {
     if (i > 0) console.log('');
     const m = mirrors[i];
     const tracking = readTrackingRef(m.remote);
+    if (!tracking) {
+      issues.push({
+        problem: `'${m.remote}': no local tracking ref`,
+        fix: `git-auto-remote mirror pull ${m.remote}   # seeds from the remote if present (C1-b), else full-history replay`,
+      });
+    }
     const remoteTip = revParse(`refs/remotes/${m.remote}/${m.syncBranch}`);
     // `behind` semantics:
     //   - tracking present + ancestor of remoteTip -> standard <tracking>..<tip>
@@ -98,6 +116,36 @@ export function mirrorStatus(remoteArg?: string, options: { showRemotes?: boolea
       console.warn(`    git config --unset remote.${m.remote}.fetch '^\\+refs/git-auto-remote/mirror'`);
     }
   }
+  // --- Global diagnostics + remediation (C1-h) ------------------------------
+  const sentinelRemote = getMirrorInProgress();
+  if (sentinelRemote !== null && !amInProgress()) {
+    issues.push({
+      problem: `stale mirror-in-progress sentinel for '${sentinelRemote}' (no git am running)`,
+      fix: `git-auto-remote mirror skip ${sentinelRemote}   # clear it (CI auto-heals via 'mirror pull --non-interactive')`,
+    });
+  }
+  const hookVersion = getInstalledHookVersion('post-applypatch');
+  if (hookVersion && hookVersion !== VERSION) {
+    issues.push({
+      problem: `installed hooks pin git-auto-remote@${hookVersion} but running @${VERSION} (warning only)`,
+      fix: `git-auto-remote setup   # refresh hooks to @${VERSION}`,
+    });
+  }
+
+  if (issues.length > 0) {
+    console.error('');
+    console.error('Diagnostics & remediation:');
+    for (const { problem, fix } of issues) {
+      console.error(`  - ${problem}`);
+      console.error(`      fix: ${fix}`);
+    }
+    printNext('git-auto-remote mirror status', `${issues.length} issue(s) above - run each 'fix:' command, then re-check`);
+  } else if (review) {
+    printNext('git-auto-remote mirror continue', 'a review is pending - stage it and resume (or mirror skip)');
+  } else {
+    printNext('git-auto-remote mirror ci <remote>', 'config + state healthy - one-shot CI sync (or mirror pull)');
+  }
+
   return 0;
 }
 
