@@ -36,6 +36,7 @@ import {
   clearMirrorInProgress,
   clearPendingCommit,
   clearReviewPending,
+  deleteTrackingRef,
   getMirrorInProgress,
   getReviewPending,
   pushTrackingRef,
@@ -139,15 +140,27 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     return 1;
   }
 
-  // v0.7.0 CRIT-3 (see 2026-04-18-audit.md): stale-sentinel handling
-  // If sentinel is set but no git am is running, the previous run left state
-  // behind (crash, manual abort, etc.). Refuse and tell user how to clean up.
+  // v0.7.0 CRIT-3 / C1-d: stale-sentinel handling. A sentinel set with no git
+  // am running means a previous run left state behind (crash, manual abort).
+  // By now we already know the tree is clean and there's no pending review, so
+  // the sentinel is genuinely orphaned. In --non-interactive (CI) auto-heal:
+  // clear it and continue. Interactively, refuse with a self-guiding fix.
   const inProgressRemote = getMirrorInProgress();
   if (inProgressRemote !== null && !amInProgress()) {
-    console.error(
-      `[git-auto-remote] stale mirror-in-progress sentinel for ${inProgressRemote} but no git am running. Run 'git-auto-remote mirror skip ${inProgressRemote}' to clean up.`
-    );
-    return 1;
+    if (options.nonInteractive) {
+      console.error(
+        `[git-auto-remote] Auto-healing stale mirror-in-progress sentinel for ${inProgressRemote} (no git am running); continuing.`,
+      );
+      clearMirrorInProgress();
+    } else {
+      console.error(
+        `[git-auto-remote] stale mirror-in-progress sentinel for ${inProgressRemote} but no git am running.`,
+      );
+      console.error(`  Clean up:  git-auto-remote mirror skip ${inProgressRemote}`);
+      console.error(`  Auto-heal: git-auto-remote mirror pull --non-interactive ${inProgressRemote}`);
+      console.error(`  Next: git-auto-remote mirror skip ${inProgressRemote}  # clear the orphaned sentinel, then re-run pull`);
+      return 1;
+    }
   }
 
   // Fetch latest mirror state.
@@ -261,6 +274,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     if (seg.kind === 'range') {
       printApplyingLines(seg.commits, mirror.remote);
       const headBeforeRange = revParse('HEAD');
+      const trackingBeforeRange = readTrackingRef(mirror.remote);
       setMirrorInProgress(mirror.remote);
       const result = applyRange(
         seg.commits,
@@ -278,6 +292,14 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
         // `git am` stopped; leave it for the user (or abort in CI mode).
         if (options.nonInteractive) {
           git('am', '--abort');
+          // C1-d: the abort rewound HEAD, but post-applypatch may have advanced
+          // the tracking ref to a mid-batch commit. Rewind it to the pre-range
+          // value so the next run re-attempts the whole range; clear sentinel.
+          if (readTrackingRef(mirror.remote) !== trackingBeforeRange) {
+            if (trackingBeforeRange) updateTrackingRef(mirror.remote, trackingBeforeRange);
+            else deleteTrackingRef(mirror.remote);
+          }
+          clearMirrorInProgress();
           printSegmentSummary(mirror.remote, applied, skipped, 'conflict');
           return 2;
         }
