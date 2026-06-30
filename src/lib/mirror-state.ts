@@ -180,3 +180,20 @@ export function deleteTrackingRef(remote: string): void {
   gitTry('update-ref', '-d', trackingRefName(remote));
   gitTry('update-ref', '-d', legacyTrackingRefName(remote));
 }
+
+/**
+ * Push the tracking ref to its OWN remote (same-direction only) with
+ * `--force-with-lease` keyed on `expectedRemote` - the value we observed at the
+ * start of this run. The tracking ref is monotonic/authoritative, so:
+ *   - a normal advance (remote still at our base) fast-forwards and succeeds;
+ *   - a concurrent CI that already advanced the remote ref past our base trips
+ *     the lease and is NOT clobbered.
+ * `expectedRemote === null` means "we had no base" -> expect the ref absent on
+ * the remote. Returns true on a successful push, false on a declined lease or
+ * any other push failure (caller decides whether that is fatal).
+ */
+export function pushTrackingRef(remote: string, expectedRemote: string | null): boolean {
+  const ref = trackingRefName(remote);
+  const lease = `--force-with-lease=${ref}:${expectedRemote ?? ''}`;
+  return gitTry('push', '--quiet', lease, remote, `${ref}:${ref}`) !== null;
+}

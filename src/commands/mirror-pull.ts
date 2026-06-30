@@ -38,6 +38,7 @@ import {
   clearReviewPending,
   getMirrorInProgress,
   getReviewPending,
+  pushTrackingRef,
   readTrackingRef,
   setMirrorInProgress,
   setPendingCommit,
@@ -368,13 +369,13 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     }
   }
 
-  // All segments applied cleanly.
+  // All segments applied cleanly. C1-c: push with --force-with-lease keyed on
+  // `last` (the value we observed at the start) so a concurrent CI that already
+  // advanced the remote ref is not clobbered. Warning-not-fatal.
   if (mirror.pushSyncRef) {
-    try {
-      git('push', '--quiet', mirror.remote, `${trackingRefName(mirror.remote)}:${trackingRefName(mirror.remote)}`);
-    } catch {
+    if (!pushTrackingRef(mirror.remote, last)) {
       console.error(
-        `[mirror ${mirror.remote}] Warning: failed to push tracking ref; state not durable across fresh clones.`,
+        `[mirror ${mirror.remote}] Warning: failed to push tracking ref (lease declined or network); state not durable across fresh clones.`,
       );
     }
   }
