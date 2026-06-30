@@ -1,0 +1,141 @@
+# Canonical git-auto-remote CI sync workflow (v0.8.0+).
+#
+# Bidirectional, self-healing mirror sync between two repos with disjoint
+# histories. One persistent review branch + ONE persistent PR per direction;
+# clean syncs flow through automatically, conflicts hold the single PR open for
+# a human/LLM to resolve (see docs/agent-runbook.md).
+#
+# This is GENERIC. Instantiate it by editing the `env:` block and the two
+# `gh pr` remotes below. The heavy lifting is a single command per direction:
+#
+#     git-auto-remote mirror ci <source-remote> --review-ref refs/heads/gar-sync/<dir>
+#
+# which: loads committed config (no bootstrap), installs hooks, seeds the
+# tracking ref from the remote (no full-replay on a fresh clone), checks out the
+# target branch, runs a non-interactive self-healing pull, and on a clean sync
+# pushes the tracking ref to its OWN remote (force-with-lease). Exit codes:
+#   0 = synced clean      2 = review needed (review ref written)      1 = hard error
+#
+# DUAL-BRANCH CAVEAT: if your committed auto-remote.gitconfig lives only on one
+# branch, materialize it to a .git/ path + `git config auto-remote.configFile`
+# before the sync (see examples/auto-remote.gitconfig). Add that as a step here.
+#
+# LEAK SAFETY (--no-verify): gar's pre-push guard refuses cross-history pushes.
+# `mirror ci` bypasses it for ITS OWN sync/tracking pushes (sanctioned). When
+# THIS workflow pushes a public-content review branch to the PRIVATE remote, add
+# `--no-verify` to that private-remote push only - the guard MUST stay ON for
+# any push to the PUBLIC remote (that is where leak prevention matters).
+
+name: mirror-sync
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      auto_merge:
+        description: 'Enable auto-merge on clean review PRs'
+        type: boolean
+        default: true
+  push:
+    branches: [private] # the branch your default checkout lands on
+
+concurrency:
+  group: mirror-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  # ---- instantiate these for your repos ----
+  PR_REMOTE: origin # the repo that HOSTS the review PRs (usually your private repo)
+  # Two directions: "<source-remote>=<review-branch>"
+  DIR_A_REMOTE: public-repo
+  DIR_A_BRANCH: gar-sync/public-to-private
+  DIR_A_BASE: private # PR base for direction A
+  DIR_B_REMOTE: private-repo
+  DIR_B_BRANCH: gar-sync/private-to-public
+  DIR_B_BASE: public-mirror # PR base for direction B (public content hosted on the private repo)
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: private
+          fetch-depth: 0 # full history: gar replays commits
+
+      - uses: oven-sh/setup-bun@v2
+
+      # Wire the two remotes (use tokens/secrets appropriate to your setup).
+      # The PUBLIC remote must use a credential that can read it; the PRIVATE
+      # remote is usually `origin` already.
+      - name: Configure mirror remotes
+        run: |
+          git remote add public-repo "https://x-access-token:${{ secrets.PUBLIC_REPO_TOKEN }}@github.com/OWNER/public-repo.git" || true
+          git remote rename origin private-repo 2>/dev/null || true
+          git remote add private-repo "$(git config remote.origin.url)" 2>/dev/null || true
+          git fetch --no-tags private-repo
+          git fetch --no-tags public-repo
+          # Keep the public-content branch on the private repo in step with public.
+          git push --no-verify private-repo "refs/remotes/public-repo/main:refs/heads/${DIR_B_BASE}" || true
+
+      # One self-healing command per direction. `|| true` so we can inspect the
+      # exit code without failing the step prematurely.
+      - name: Sync direction A (public -> private)
+        id: dir_a
+        run: |
+          set +e
+          git-auto-remote mirror ci "${DIR_A_REMOTE}" --review-ref "refs/heads/${DIR_A_BRANCH}"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Sync direction B (private -> public)
+        id: dir_b
+        run: |
+          set +e
+          git-auto-remote mirror ci "${DIR_B_REMOTE}" --review-ref "refs/heads/${DIR_B_BRANCH}"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      # On exit 2 a review ref exists locally; push it to the PR-hosting remote
+      # (--no-verify: review branches carry classified content and live on the
+      # private repo) and find-or-refresh exactly ONE PR per direction.
+      - name: Open/refresh review PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          open_pr() {
+            local rc="$1" branch="$2" base="$3" remote="$4"
+            [ "$rc" = "2" ] || return 0
+            git push --no-verify --force-with-lease "${PR_REMOTE}" "refs/heads/${branch}:refs/heads/${branch}"
+            if [ -z "$(gh pr list --head "$branch" --base "$base" --state open --json number --jq '.[].number')" ]; then
+              gh pr create --base "$base" --head "$branch" \
+                --title "gar mirror sync: ${remote} -> ${base}" \
+                --body "Automated mirror sync review for \`${remote}\`. A human/LLM resolves conflicts per docs/agent-runbook.md. The consuming repo's own CI verifies this PR."
+            else
+              gh pr comment "$(gh pr list --head "$branch" --base "$base" --state open --json number --jq '.[0].number')" \
+                --body "Refreshed by mirror-sync run ${{ github.run_id }}."
+            fi
+            # Enable auto-merge so a CLEAN (no-conflict) review PR flows green once
+            # the consuming repo's CI passes; a conflicting PR simply won't merge.
+            if [ "${{ inputs.auto_merge != false }}" = "true" ]; then
+              gh pr merge --auto --squash "$branch" || true
+            fi
+          }
+          open_pr "${{ steps.dir_a.outputs.rc }}" "${DIR_A_BRANCH}" "${DIR_A_BASE}" "${DIR_A_REMOTE}"
+          open_pr "${{ steps.dir_b.outputs.rc }}" "${DIR_B_BRANCH}" "${DIR_B_BASE}" "${DIR_B_REMOTE}"
+
+      # A pending review PR is NOT a failure (otherwise the schedule goes red for
+      # the entire duration of a normal, expected human review). Fail ONLY on a
+      # true hard error (gar exit 1).
+      - name: Fail only on hard error
+        run: |
+          rc_a="${{ steps.dir_a.outputs.rc }}"
+          rc_b="${{ steps.dir_b.outputs.rc }}"
+          if [ "$rc_a" = "1" ] || [ "$rc_b" = "1" ]; then
+            echo "::error::git-auto-remote hard error (A=$rc_a B=$rc_b). See logs; run 'git-auto-remote mirror status' locally."
+            exit 1
+          fi
+          echo "sync ok (A=$rc_a B=$rc_b): 0=synced, 2=review PR open/updated"

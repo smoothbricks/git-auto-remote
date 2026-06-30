@@ -215,6 +215,91 @@ git config --add remote.public-repo.push 'refs/git-auto-remote/mirror/*:refs/git
 
 Pre-v0.6.1 the tool itself auto-added a force-fetch refspec `+refs/git-auto-remote/mirror/*:refs/git-auto-remote/mirror/*` to mirror remotes; that was removed in v0.6.1 because it silently clobbered local tracking state on every fetch. Push refspecs are the user's responsibility.
 
+## CI / GitHub Actions setup
+
+A fresh CI clone can sync with a **single command per direction** and no
+host-specific bootstrap. The canonical, reusable workflow is
+[`examples/github-actions/mirror-sync.yml`](examples/github-actions/mirror-sync.yml)
+(bidirectional; one persistent review branch + one PR per direction).
+
+1. **Commit your mirror config** so every clone knows it (kills the historical
+   "No mirror configured for remote '<x>'" CI failure). Copy
+   [`examples/auto-remote.gitconfig`](examples/auto-remote.gitconfig) to your
+   repo root as `auto-remote.gitconfig` (the default the tool looks for), or
+   `tooling/auto-remote.gitconfig`, or point at it with
+   `git config auto-remote.configFile <path>`. `mirror pull`/`mirror ci` read
+   this committed file merged under standard `git config` (standard `git config`
+   wins on conflicts).
+2. **Run one command per direction:**
+   ```bash
+   git-auto-remote mirror ci public-repo --review-ref refs/heads/gar-sync/public-to-private
+   git-auto-remote mirror ci private-repo --review-ref refs/heads/gar-sync/private-to-public
+   ```
+   `mirror ci` ensures config is loaded, installs hooks, seeds the tracking ref
+   from the remote (no full-replay on a fresh clone), checks out the target
+   branch, runs a non-interactive self-healing pull, and on a clean sync pushes
+   the tracking ref to its OWN remote with `--force-with-lease`. Exit codes:
+   `0` synced · `2` review needed (review ref written, nothing else pushed) ·
+   `1` hard error. On exit 2 the printed `Next:` line is the exact push + open-PR
+   command.
+
+**Dual-branch caveat.** The committed config is read from the WORKING TREE of the
+checked-out branch. If your config lives only on one branch (e.g. it is excluded
+from the public branch's content), gar on the other branch can't find it.
+Materialize it once to a branch-independent `.git/` path and point gar at it:
+
+```bash
+git show <config-branch>:auto-remote.gitconfig > "$(git rev-parse --git-dir)/auto-remote.gitconfig"
+git config auto-remote.configFile "$(git rev-parse --git-dir)/auto-remote.gitconfig"
+```
+
+**Pre-push guard & `--no-verify`.** gar's pre-push hook refuses cross-history
+pushes. `mirror ci` bypasses it for its OWN sync/tracking pushes (sanctioned). If
+your workflow itself pushes a public-content review branch to the PRIVATE remote,
+add `--no-verify` to *that* private-remote push only — the guard MUST stay ON for
+any push to the PUBLIC remote, where leak prevention matters.
+
+## Self-healing & agent usage
+
+v0.8.0 makes the tool idiot-proof for a blank-session agent or a fresh CI clone.
+Every command, on every terminal path, ends with a `Next: <command>  # <why>`
+line, so an agent can parse the exact next step. Highlights:
+
+- **`mirror status` is diagnostic + remediation.** It names each problem and
+  prints the exact fix: no config, no local tracking ref (present on the remote),
+  stale `mirror-in-progress` sentinel, version skew, and cross-direction refspec.
+- **Config self-heals** from the committed `auto-remote.gitconfig` (above) — no
+  `.git/config` stamping needed.
+- **Tracking refs self-seed**: `mirror pull` fetches the remote's tracking ref
+  when the local one is absent, so a fresh clone does an incremental pull instead
+  of a full-history replay (`--no-seed-tracking` opts out).
+- **Stale state self-heals**: an orphaned in-progress sentinel auto-clears under
+  `--non-interactive`; the tracking-ref push uses `--force-with-lease` so a
+  concurrent CI is never clobbered.
+- **Version skew warns, never blocks** (refresh hooks with `git-auto-remote
+  setup`).
+
+For resolving a paused/conflicted sync as an LLM, follow
+[`docs/agent-runbook.md`](docs/agent-runbook.md).
+
+## Single-PR review flow per direction
+
+`mirror pull --review-ref <ref>` (and `mirror ci`, which wraps it) turns a
+non-interactive partial/conflict into a reviewable branch instead of discarding
+it. On a partial/conflict the tool assembles the `included` subset + the review
+overlay (with any `git am --3way` conflict markers left in place) into `<ref>`,
+**without advancing the tracking ref**, and exits 2. A fully clean run never
+creates `<ref>` and advances normally.
+
+The intended topology is **one persistent review branch + one persistent PR per
+direction** (e.g. `gar-sync/public-to-private`, `gar-sync/private-to-public`).
+Each run regenerates the branch from the last-synced position and force-pushes it
+(`--force-with-lease`); the workflow finds-or-refreshes the single PR rather than
+spamming new ones. Enable GitHub auto-merge so a clean review PR flows green once
+the **consuming repo's own CI** verifies it, while a conflicting PR simply holds
+open until a human/LLM resolves it (per the runbook). A pending review PR is not
+a workflow failure, so the schedule stays green during expected reviews.
+
 ## Commands
 
 ```
@@ -229,9 +314,13 @@ git-auto-remote mirror status [<remote>] [--remotes]  Show sync state.
                                           on each mirror remote and compares
                                           tracking refs (drift diagnostic).
 git-auto-remote mirror bootstrap <remote> <sha> [--force]
-git-auto-remote mirror pull [<remote>] [--non-interactive] [--on-partial <cmd>]
+git-auto-remote mirror pull [<remote>] [--non-interactive] [--on-partial <cmd>] [--review-ref <ref>] [--no-seed-tracking]
+git-auto-remote mirror ci [<remote>] [--review-ref <ref>] [--push-branch-to <r[:dst]>] [--no-push] [--no-seed-tracking]
+                                                # one-shot self-healing CI sync (setup+seed+pull+push)
+                                                # exit 0 synced / 2 review needed / 1 hard error
 git-auto-remote mirror continue [<remote>]     # resolve any pause sub-case
 git-auto-remote mirror skip [<remote>]         # skip the paused commit
+git-auto-remote mirror abort [<remote>]        # stop sync, rewind tracking to retry
 git-auto-remote mirror diff [<remote>] [--raw] [git-diff-args...]
                                                 # during a pause: show source-vs-HEAD diff
                                                 # scoped to paths THIS commit touched in

@@ -1,0 +1,63 @@
+# git-auto-remote committed mirror config (self-healing config loading, v0.8.0+).
+#
+# WHY THIS FILE EXISTS
+#   Before v0.8.0 a mirror was configured only by stamping `[auto-remote ...]`
+#   into each clone's `.git/config` via a host-specific bootstrap. A fresh CI
+#   clone never ran that bootstrap, so `mirror pull` reported
+#   "No mirror configured for remote '<x>'" and the whole sync failed.
+#
+#   v0.8.0 makes config self-healing: `mirror pull` / `mirror ci` read THIS
+#   committed file in addition to standard `git config`. Commit it and every
+#   clone - laptop or CI - knows the mirror config with zero bootstrap.
+#
+# WHERE TO PUT IT (resolution order; first match wins)
+#   1. the path in `git config auto-remote.configFile <path>`
+#   2. `auto-remote.gitconfig` at the repo root   <-- the default; rename to this
+#   3. `tooling/auto-remote.gitconfig`
+#
+# PRECEDENCE
+#   Standard `git config` overrides this committed file key-by-key, so a host
+#   can still override a single setting locally without editing the committed file.
+#
+# DUAL-BRANCH CAVEAT (read if you sync two branches in one working tree)
+#   The committed file is read from the WORKING TREE of whatever branch is
+#   checked out. If your config lives only on one branch (e.g. it is excluded
+#   from the public branch's content), gar on the OTHER branch can't find it.
+#   Fix: materialize the config to a branch-independent path inside `.git/` once,
+#   and point gar at it:
+#       git show <config-branch>:auto-remote.gitconfig > "$(git rev-parse --git-dir)/auto-remote.gitconfig"
+#       git config auto-remote.configFile "$(git rev-parse --git-dir)/auto-remote.gitconfig"
+#   (Or keep a copy committed on both branches.)
+#
+# Each [auto-remote "<remote>"] section is ONE sync DIRECTION: replay commits
+# FROM that git remote INTO the local `syncTargetBranch`. See the README
+# "Mirror sync" table for every key.
+
+# --- Direction 1: public-repo -> private branch --------------------------------
+[auto-remote "public-repo"]
+	# Allowlist of paths to replay (space-separated). Presence makes the remote a mirror.
+	syncPaths         = packages shared
+	# Or keep the list in a committed, branch-independent file:
+	# syncPathsFile   = tooling/git-mirror-paths.txt
+	# Never cross, even if under syncPaths:
+	excludePaths      = packages/private-only
+	# Brought into the worktree unstaged at pause time for a human/LLM glance:
+	reviewPaths       = tooling/workspace.gitconfig
+	# Derived files: dropped from incoming patches, regenerated locally:
+	regeneratePaths   = bun.lock
+	regenerateCommand = bun install
+	syncBranch        = main
+	syncTargetBranch  = private
+	# Push the tracking ref to its OWN remote after each advance (CI durability):
+	pushSyncRef       = true
+
+# --- Direction 2: private-repo -> public branch --------------------------------
+[auto-remote "private-repo"]
+	syncPaths         = packages shared
+	excludePaths      = packages/private-only
+	reviewPaths       = tooling/workspace.gitconfig
+	regeneratePaths   = bun.lock
+	regenerateCommand = bun install
+	syncBranch        = private
+	syncTargetBranch  = public
+	pushSyncRef       = true
