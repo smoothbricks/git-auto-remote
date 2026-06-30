@@ -62,7 +62,46 @@ export type MirrorPullOptions = {
    * trap). Best-effort; default true. Set false for `--no-seed-tracking`.
    */
   seedTracking?: boolean;
+  /**
+   * Non-interactive single-PR-per-direction review flow. When a partial/conflict
+   * is hit, assemble the reviewable state (included subset + review overlay, with
+   * any `git am --3way` conflict markers left in place) into this ref WITHOUT
+   * advancing the tracking ref, then exit 2. A fully clean run never creates it.
+   */
+  reviewRef?: string | null;
 };
+
+/**
+ * C1-f: capture the current worktree+index state (included subset applied to
+ * HEAD, review overlay, and any `git am --3way` conflict markers) as a commit
+ * parented on HEAD, and point `ref` at it. Uses `commit-tree` so it works even
+ * while a `git am` is stopped - it never moves HEAD or touches am state. The
+ * commit preserves the source commit's author/date/message. Returns false on
+ * failure (caller treats as a hard error).
+ */
+function captureReviewRef(ref: string, sourceSha: string): boolean {
+  gitTry('add', '-A');
+  const tree = gitTry('write-tree');
+  if (!tree) return false;
+  const meta = readCommitMeta(sourceSha);
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: meta.authorName,
+    GIT_AUTHOR_EMAIL: meta.authorEmail,
+    GIT_AUTHOR_DATE: meta.authorDate,
+    GIT_COMMITTER_NAME: meta.authorName,
+    GIT_COMMITTER_EMAIL: meta.authorEmail,
+    GIT_COMMITTER_DATE: meta.authorDate,
+  };
+  const head = revParse('HEAD');
+  const args = ['commit-tree', tree, '-m', meta.message];
+  if (head) args.push('-p', head);
+  const r = spawnSync('git', args, { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const commit = (r.stdout ?? '').trim();
+  if (r.status !== 0 || !commit) return false;
+  git('update-ref', ref, commit);
+  return true;
+}
 
 /**
  * Exit codes:
@@ -270,6 +309,27 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   let applied = 0;
   let skipped = 0;
 
+  // C1-f: in --review-ref mode a partial/conflict assembles a reviewable commit
+  // into <ref> and then rewinds the target branch + tracking ref so NOTHING is
+  // permanently applied here; the operator reviews/merges <ref> instead.
+  const headBeforeRun = revParse('HEAD');
+  const finalizeReviewRef = (sourceSha: string): number => {
+    if (amInProgress()) gitTry('am', '--abort');
+    clearMirrorInProgress();
+    clearReviewPending();
+    clearPendingCommit();
+    if (headBeforeRun) git('reset', '--hard', headBeforeRun);
+    if (readTrackingRef(mirror.remote) !== last) {
+      if (last) updateTrackingRef(mirror.remote, last);
+      else deleteTrackingRef(mirror.remote);
+    }
+    console.error(`[mirror ${mirror.remote}] Review ref written: ${options.reviewRef} (${sourceSha.slice(0, 8)}); tracking ref unchanged.`);
+    console.error(
+      `  Next: git push --force-with-lease ${mirror.remote} ${options.reviewRef} && gh pr create --base ${mirror.syncTargetBranch} --head ${options.reviewRef}  # open/refresh the review PR`,
+    );
+    return 2;
+  };
+
   for (const seg of segments) {
     if (seg.kind === 'range') {
       printApplyingLines(seg.commits, mirror.remote);
@@ -291,6 +351,12 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
       if (result === 'conflict') {
         // `git am` stopped; leave it for the user (or abort in CI mode).
         if (options.nonInteractive) {
+          if (options.reviewRef) {
+            const conflictSha = readCurrentPatchSha() ?? seg.commits[seg.commits.length - 1].sha;
+            captureReviewRef(options.reviewRef, conflictSha);
+            printSegmentSummary(mirror.remote, applied, skipped, 'conflict');
+            return finalizeReviewRef(conflictSha);
+          }
           git('am', '--abort');
           // C1-d: the abort rewound HEAD, but post-applypatch may have advanced
           // the tracking ref to a mid-batch commit. Rewind it to the pre-range
@@ -382,6 +448,9 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
       } else if (partialResult.kind === 'paused') {
         printSegmentSummary(mirror.remote, applied + 1, skipped, 'partial');
         return 0; // pause cleanly
+      } else if (partialResult.kind === 'review-ref') {
+        printSegmentSummary(mirror.remote, applied, skipped, 'partial');
+        return finalizeReviewRef(seg.commit.sha);
       } else if (partialResult.kind === 'stopped') {
         printSegmentSummary(mirror.remote, applied, skipped, 'partial');
         return 2;
@@ -412,6 +481,7 @@ type PartialResult =
   | { kind: 'applied' }
   | { kind: 'skipped' }
   | { kind: 'paused' }
+  | { kind: 'review-ref' }
   | { kind: 'stopped' }
   | { kind: 'error' };
 
@@ -450,7 +520,7 @@ async function handlePartial(
   // human round-trip for no reason. Fall through to auto-apply (the
   // review=[] short-circuit after the `git am` step handles the actual
   // auto-apply and emits the one-line note).
-  if (options.nonInteractive && !handler && review.length > 0) {
+  if (options.nonInteractive && !handler && review.length > 0 && !options.reviewRef) {
     printPartialHeader(mirror.remote, subject, commit.sha, review, regenerate, outside);
     return { kind: 'stopped' };
   }
@@ -499,6 +569,10 @@ async function handlePartial(
       phase: 'am-in-progress',
     });
     if (options.nonInteractive) {
+      if (options.reviewRef) {
+        captureReviewRef(options.reviewRef, commit.sha);
+        return { kind: 'review-ref' };
+      }
       git('am', '--abort');
       clearMirrorInProgress();
       // Remove the marker we just set: nothing to continue to in CI (a human
@@ -624,6 +698,11 @@ async function handlePartial(
     }
   }
 
+  if (options.nonInteractive && options.reviewRef) {
+    captureReviewRef(options.reviewRef, commit.sha);
+    return { kind: 'review-ref' };
+  }
+
   setReviewPending({
     remote: mirror.remote,
     sourceSha: commit.sha,
@@ -741,6 +820,11 @@ function handlePureReview(
     return { kind: 'error' };
   }
   printOverlayNote(mirror.remote, overlay);
+
+  if (options.nonInteractive && options.reviewRef) {
+    captureReviewRef(options.reviewRef, sha);
+    return { kind: 'review-ref' };
+  }
 
   // Capture source metadata for a potential re-commit on continue.
   const meta = readCommitMeta(sha);

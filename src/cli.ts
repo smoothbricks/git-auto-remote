@@ -125,6 +125,10 @@ mirror
   .option('--non-interactive', 'Stop at first partial/conflict instead of pausing (CI mode)')
   .option('--on-partial <cmd>', 'Shell command invoked on each partial commit')
   .option('--no-seed-tracking', 'Do not seed the tracking ref from the remote on a fresh clone')
+  .option(
+    '--review-ref <ref>',
+    'CI: on partial/conflict, assemble the reviewable commit into <ref> (do not advance tracking) and exit 2',
+  )
   .addHelpText(
     'after',
     `
@@ -135,13 +139,18 @@ Exit code: 0 resolved, 1 punt, 2 skip. Dirty worktree on exit -> abort.
 `,
   )
   .action(
-    asAction((remote: string | undefined, opts: { nonInteractive?: boolean; onPartial?: string; seedTracking?: boolean }) =>
-      mirrorPull({
-        remote,
-        nonInteractive: !!opts.nonInteractive,
-        onPartial: opts.onPartial ?? null,
-        seedTracking: opts.seedTracking,
-      }),
+    asAction(
+      (
+        remote: string | undefined,
+        opts: { nonInteractive?: boolean; onPartial?: string; seedTracking?: boolean; reviewRef?: string },
+      ) =>
+        mirrorPull({
+          remote,
+          nonInteractive: !!opts.nonInteractive,
+          onPartial: opts.onPartial ?? null,
+          seedTracking: opts.seedTracking,
+          reviewRef: opts.reviewRef ?? null,
+        }),
     ),
   );
 
