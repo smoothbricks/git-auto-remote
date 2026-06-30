@@ -124,6 +124,7 @@ mirror
   .description('Apply new commits from <remote> onto current branch')
   .option('--non-interactive', 'Stop at first partial/conflict instead of pausing (CI mode)')
   .option('--on-partial <cmd>', 'Shell command invoked on each partial commit')
+  .option('--no-seed-tracking', 'Do not seed the tracking ref from the remote on a fresh clone')
   .addHelpText(
     'after',
     `
@@ -134,11 +135,12 @@ Exit code: 0 resolved, 1 punt, 2 skip. Dirty worktree on exit -> abort.
 `,
   )
   .action(
-    asAction((remote: string | undefined, opts: { nonInteractive?: boolean; onPartial?: string }) =>
+    asAction((remote: string | undefined, opts: { nonInteractive?: boolean; onPartial?: string; seedTracking?: boolean }) =>
       mirrorPull({
         remote,
         nonInteractive: !!opts.nonInteractive,
         onPartial: opts.onPartial ?? null,
+        seedTracking: opts.seedTracking,
       }),
     ),
   );

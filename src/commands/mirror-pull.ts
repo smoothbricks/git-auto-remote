@@ -54,6 +54,12 @@ export type MirrorPullOptions = {
   nonInteractive?: boolean;
   /** Override `auto-remote.<name>.partialHandler` for this invocation. */
   onPartial?: string | null;
+  /**
+   * Before computing the range, fetch the remote's tracking ref into the local
+   * namespace when the local ref is absent (kills the full-replay-on-fresh-clone
+   * trap). Best-effort; default true. Set false for `--no-seed-tracking`.
+   */
+  seedTracking?: boolean;
 };
 
 /**
@@ -175,6 +181,24 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   } catch (e) {
     console.error(`[mirror ${mirror.remote}] fetch failed: ${(e as Error).message}`);
     return 1;
+  }
+
+  // C1-b: self-healing tracking-ref seeding. The pull reads the LOCAL tracking
+  // ref, but a fresh CI clone has none - which would trigger a full-history
+  // replay even when the remote already advertises an up-to-date tracking ref.
+  // When the local ref is absent, best-effort fetch the remote's tracking ref
+  // into the local namespace so the range is computed incrementally. If the
+  // remote lacks it, we fall through to the existing full-replay notice below.
+  // The narrow explicit refspec keeps this same-direction-only (we only ever
+  // fetch <remote>'s OWN tracking ref FROM <remote>).
+  if (options.seedTracking !== false && readTrackingRef(mirror.remote) === null) {
+    const ref = trackingRefName(mirror.remote);
+    const seeded = gitTry('fetch', '--quiet', mirror.remote, `${ref}:${ref}`);
+    if (seeded !== null && readTrackingRef(mirror.remote) !== null) {
+      console.error(
+        `[mirror ${mirror.remote}] Seeded tracking ref from ${mirror.remote} (${readTrackingRef(mirror.remote)?.slice(0, 8)}); incremental sync.`,
+      );
+    }
   }
 
   const last = readTrackingRef(mirror.remote);
