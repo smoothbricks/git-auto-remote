@@ -182,18 +182,26 @@ export function deleteTrackingRef(remote: string): void {
 }
 
 /**
- * Push the tracking ref to its OWN remote (same-direction only) with
- * `--force-with-lease` keyed on `expectedRemote` - the value we observed at the
- * start of this run. The tracking ref is monotonic/authoritative, so:
- *   - a normal advance (remote still at our base) fast-forwards and succeeds;
- *   - a concurrent CI that already advanced the remote ref past our base trips
- *     the lease and is NOT clobbered.
- * `expectedRemote === null` means "we had no base" -> expect the ref absent on
- * the remote. Returns true on a successful push, false on a declined lease or
- * any other push failure (caller decides whether that is fatal).
+ * Push the tracking ref to its OWN remote (same-direction only). The tracking
+ * ref is monotonic/authoritative:
+ *   - When the remote has no such ref yet, plainly create it (nothing to
+ *     clobber; a racing concurrent create is still rejected as non-ff).
+ *   - Otherwise push with `--force-with-lease` keyed on `expectedRemote` - the
+ *     value we observed at the start of this run - so a concurrent CI that
+ *     already advanced the remote ref past our base trips the lease and is NOT
+ *     clobbered.
+ * `expectedRemote === null` means "we had no base" -> expect the ref absent.
+ * Returns true on a successful push, false on a declined lease, unreachable
+ * remote, or any other push failure (caller decides whether that is fatal).
  */
 export function pushTrackingRef(remote: string, expectedRemote: string | null): boolean {
   const ref = trackingRefName(remote);
+  if (gitTry('ls-remote', '--exit-code', remote, ref) === null) {
+    // Remote has no tracking ref yet (or is unreachable). Create it directly.
+    // --no-verify: this is a tool-owned, same-direction-by-construction push;
+    // the user-facing pre-push gate (cross-history guard) must not block it.
+    return gitTry('push', '--quiet', '--no-verify', remote, `${ref}:${ref}`) !== null;
+  }
   const lease = `--force-with-lease=${ref}:${expectedRemote ?? ''}`;
-  return gitTry('push', '--quiet', lease, remote, `${ref}:${ref}`) !== null;
+  return gitTry('push', '--quiet', '--no-verify', lease, remote, `${ref}:${ref}`) !== null;
 }

@@ -5,6 +5,7 @@ import { Command, CommanderError } from 'commander';
 import { detect } from './commands/detect.js';
 import { mirrorAbort } from './commands/mirror-abort.js';
 import { mirrorBootstrap } from './commands/mirror-bootstrap.js';
+import { mirrorCi } from './commands/mirror-ci.js';
 import { mirrorContinue } from './commands/mirror-continue.js';
 import { mirrorDiff } from './commands/mirror-diff.js';
 import { mirrorList } from './commands/mirror-list.js';
@@ -150,6 +151,41 @@ Exit code: 0 resolved, 1 punt, 2 skip. Dirty worktree on exit -> abort.
           onPartial: opts.onPartial ?? null,
           seedTracking: opts.seedTracking,
           reviewRef: opts.reviewRef ?? null,
+        }),
+    ),
+  );
+
+mirror
+  .command('ci [remote]')
+  .description('One-shot self-healing CI sync for a direction (or all): hooks, seed, pull, push')
+  .option('--review-ref <ref>', 'Review ref to assemble on partial/conflict (default: refs/heads/gar-sync/<remote>)')
+  .option('--push-branch-to <remote[:dstref]>', 'On a clean sync, also push the target branch to this remote')
+  .option('--no-push', 'Skip the optional target-branch push on a clean sync')
+  .option('--no-seed-tracking', 'Do not seed the tracking ref from the remote on a fresh clone')
+  .addHelpText(
+    'after',
+    `
+Example (CI, one direction):
+  git-auto-remote mirror ci public-repo --review-ref refs/heads/gar-sync/public-to-private
+
+Exit: 0 synced (tracking ref pushed to its source remote, force-with-lease)
+      2 review needed (review ref written locally; nothing pushed)
+      1 hard error
+Next on exit 2: push the review ref to your PR-hosting remote and open/refresh
+                ONE PR per direction (the printed 'Next:' line is exact).
+`,
+  )
+  .action(
+    asAction(
+      (
+        remote: string | undefined,
+        opts: { reviewRef?: string; pushBranchTo?: string; push?: boolean; seedTracking?: boolean },
+      ) =>
+        mirrorCi(remote, {
+          reviewRef: opts.reviewRef ?? null,
+          pushBranchTo: opts.pushBranchTo ?? null,
+          push: opts.push,
+          seedTracking: opts.seedTracking,
         }),
     ),
   );
