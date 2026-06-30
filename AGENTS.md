@@ -43,7 +43,7 @@ After resume, the loop re-enters `mirror pull` automatically and processes the n
 - `mirror skip` MUST always `updateTrackingRef(remote, review.sourceSha)` on every code path, or it loops forever on the same commit (v0.6.3 fix; CRIT-1 in v0.7.0 audit).
 - `mirror continue` MUST do the same on every path (v0.7.0 fix).
 - After `git am` lands, `postAmTransition` MUST verify HEAD's tree contains the included-paths subset of the source commit (v0.7.0 fix; CRIT-2).
-- `mirror pull` MUST refuse to start if `MERGE_HEAD` exists, the sentinel ref is stale, or installed hook pin disagrees with running tool version (v0.7.0).
+- `mirror pull` MUST refuse to start if `MERGE_HEAD` exists (v0.7.0). On a stale in-progress sentinel it refuses interactively but **auto-heals** under `--non-interactive` (v0.8.0/C1-d). On installed-hook-pin disagreement with the running tool version it **warns (not refuses)** and proceeds - blocking a CI sync because a cached hook pins an older version would be worse than the (compatible) state-file risk; refresh hooks with `git-auto-remote setup` (v0.8.0/C1-i; test: `test/version-skew.test.ts`).
 
 ## Files worth knowing
 
