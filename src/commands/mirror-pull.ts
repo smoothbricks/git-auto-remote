@@ -10,6 +10,7 @@ import {
 } from '../lib/apply.js';
 import { anyHasRegenerate, type ClassifiedCommit, classify, segment } from '../lib/classify.js';
 import { rewriteCommitterToAuthor } from '../lib/commit-rewrite.js';
+import { findEchoes } from '../lib/echo.js';
 import {
   amInProgress,
   changedPaths,
@@ -307,7 +308,7 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
     sha,
     classification: classify(changedPaths(sha), pathSpec),
   }));
-  const segments = segment(classified);
+  const segments = segment(classified, findEchoes(classified, 'HEAD', head));
 
   let applied = 0;
   let skipped = 0;
@@ -334,7 +335,13 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
   };
 
   for (const seg of segments) {
-    if (seg.kind === 'range') {
+    if (seg.kind === 'echo') {
+      const sha = seg.commit.sha;
+      console.error(
+        `[mirror ${mirror.remote}] Skipping:    ${sha.slice(0, 8)}  ${commitSubject(sha)}  (already on ${mirror.syncTargetBranch})`,
+      );
+      updateTrackingRef(mirror.remote, sha);
+    } else if (seg.kind === 'range') {
       printApplyingLines(seg.commits, mirror.remote);
       const headBeforeRange = revParse('HEAD');
       const trackingBeforeRange = readTrackingRef(mirror.remote);

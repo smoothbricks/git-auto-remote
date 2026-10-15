@@ -5,7 +5,7 @@ Git tooling for repositories that track **multiple upstreams with disjoint histo
 Two features in one CLI, both invoked via git hooks installed by `git-auto-remote setup`:
 
 1. **Auto-routing** — on branch checkout, detect which remote's root commit(s) the branch descends from and set `branch.<name>.pushRemote` accordingly. Pre-push hook refuses cross-history pushes.
-2. **Mirror sync** — on `git pull`, cherry-pick new commits from a configured mirror remote (restricted to an allowlist of paths). Empty commits and round-tripped changes drop automatically via `git am --empty=drop`.
+2. **Mirror sync** — on `git pull`, cherry-pick new commits from a configured mirror remote (restricted to an allowlist of paths). Empty commits drop automatically via `git am --empty=drop`; a change that crossed the other way and comes back (an echo) is skipped as already applied, even after the target changed the same lines since.
 
 ## Install
 
@@ -83,6 +83,8 @@ All three of `reviewPaths`, `regeneratePaths`, `syncPaths` are first-class and i
 | **Partial**      | `review` or `outside` non-empty                                             | breaks the batch; paused for review                                            |
 
 A batched run of clean + out-of-scope commits is applied via a single `git format-patch ... | git am --empty=drop --3way`.
+
+A commit the target already carries is skipped and the tracking ref advances past it: an **echo** (it crossed the other way earlier) or a conflict a person resolved in a merged review ref. Crossing keeps a commit's author, author time and message whatever happens to its content, so the target carries it when it has more commits with that author, time and message than the mirror has before it; a copy whose message was edited on the way is still found as a target commit authored in the same second that changed every file the copy would apply from the same content to the same content. Without this, `git am --3way` drops a commit only while the target holds its exact result: a release commit followed by a version bump on the same lines would conflict, and a merged resolution that kept other content would come back on every pull.
 
 ### Partial commit review (interactive)
 

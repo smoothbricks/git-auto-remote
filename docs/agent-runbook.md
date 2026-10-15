@@ -115,7 +115,9 @@ direction.
 To resolve from a PR as an LLM agent:
 
 1. Check out the review branch locally: `git fetch <pr-remote> gar-sync/<dir> && git switch gar-sync/<dir>`.
-2. Resolve any `<<<<<<<` markers in the diff exactly as in step 2a, commit.
+2. Resolve any `<<<<<<<` markers in the diff exactly as in step 2a, commit. Keep the review commit's author and
+   message (add your fix on top, or amend without rewording it), and merge without squashing: the next pull
+   recognises the merged resolution by them and moves past the source commit.
 3. Push the branch back (the PR updates in place; never open a second PR).
 4. The consuming repo's own CI verifies the PR. A CLEAN review PR can carry GitHub
    auto-merge so it flows green automatically; a conflicting one holds the single

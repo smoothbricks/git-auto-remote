@@ -115,7 +115,13 @@ export type PartialSegment = {
   commit: ClassifiedCommit;
 };
 
-export type Segment = RangeSegment | PartialSegment;
+/** A single commit whose change the target already has (see `findEchoes`): skipped, never applied. */
+export type EchoSegment = {
+  kind: 'echo';
+  commit: ClassifiedCommit;
+};
+
+export type Segment = RangeSegment | PartialSegment | EchoSegment;
 
 export type ClassifiedCommit = {
   sha: string;
@@ -123,10 +129,13 @@ export type ClassifiedCommit = {
 };
 
 /**
- * Group a sequence of classified commits into segments. Partials split the
- * sequence; consecutive clean/out-of-scope commits are batched together.
+ * Group a sequence of classified commits into segments. Partials and `echoes`
+ * split the sequence; consecutive clean/out-of-scope commits are batched together.
  */
-export function segment(commits: readonly ClassifiedCommit[]): readonly Segment[] {
+export function segment(
+  commits: readonly ClassifiedCommit[],
+  echoes: ReadonlySet<string> = new Set(),
+): readonly Segment[] {
   const segments: Segment[] = [];
   let batch: ClassifiedCommit[] = [];
 
@@ -138,7 +147,10 @@ export function segment(commits: readonly ClassifiedCommit[]): readonly Segment[
   };
 
   for (const c of commits) {
-    if (c.classification.kind === 'partial') {
+    if (echoes.has(c.sha)) {
+      flush();
+      segments.push({ kind: 'echo', commit: c });
+    } else if (c.classification.kind === 'partial') {
       flush();
       segments.push({ kind: 'partial', commit: c });
     } else {
