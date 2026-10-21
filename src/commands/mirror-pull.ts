@@ -424,16 +424,59 @@ async function runOne(mirror: MirrorConfig, options: MirrorPullOptions): Promise
       //
       // v0.5.9: propagate command-failed as hard error. Silent skip used to
       // cause stale derived state to compound across commits.
+      //
+      // The patch never carries regeneratePaths, so a range whose commits touched
+      // only those paths lands no commit. Amending then would rewrite a target
+      // commit this run did not create (e.g. an already-published one); the regen
+      // output gets its own commit with the last regenerating commit's metadata.
       if (mirror.regenerateCommand && mirror.regeneratePaths.length > 0 && anyHasRegenerate(seg.commits)) {
-        const regenResult = runRegenerate(mirror.regenerateCommand, mirror.regeneratePaths, mirror.remote, 'amend');
+        const landed = revParse('HEAD') !== headBeforeRange;
+        const regenResult = runRegenerate(
+          mirror.regenerateCommand,
+          mirror.regeneratePaths,
+          mirror.remote,
+          landed ? 'amend' : 'stage-only',
+        );
         if (regenResult.outcome === 'command-failed') {
           console.error(`[mirror ${mirror.remote}] regenerate command failed after applying range; halting.`);
+          if (!landed) {
+            // Nothing landed, so rewind tracking: the re-run must retry this range.
+            if (trackingBeforeRange) updateTrackingRef(mirror.remote, trackingBeforeRange);
+            else deleteTrackingRef(mirror.remote);
+            console.error(`[mirror ${mirror.remote}]   No HEAD commit was created and the tracking ref is unchanged.`);
+            console.error(`[mirror ${mirror.remote}]   Fix the regenerate command and re-run 'mirror pull'.`);
+            return 1;
+          }
           console.error(`[mirror ${mirror.remote}]   HEAD is at the last applied commit (un-amended for regen).`);
           console.error(
             `[mirror ${mirror.remote}]   Fix the command, then manually run it + 'git commit --amend --no-edit'`,
           );
           console.error(`[mirror ${mirror.remote}]   and re-run 'mirror pull' to continue.`);
           return 1;
+        }
+        if (!landed && regenResult.staged) {
+          const source = [...seg.commits]
+            .reverse()
+            .find((c) => c.classification.kind === 'clean' && c.classification.regenerate.length > 0);
+          const meta = readCommitMeta((source ?? seg.commits[seg.commits.length - 1]).sha);
+          // v0.6.0: committer = author across all commits this tool creates.
+          const env = {
+            ...process.env,
+            GIT_AUTHOR_NAME: meta.authorName,
+            GIT_AUTHOR_EMAIL: meta.authorEmail,
+            GIT_AUTHOR_DATE: meta.authorDate,
+            GIT_COMMITTER_NAME: meta.authorName,
+            GIT_COMMITTER_EMAIL: meta.authorEmail,
+            GIT_COMMITTER_DATE: meta.authorDate,
+          };
+          const commitResult = spawnSync('git', ['commit', '-q', '--no-verify', '-m', meta.message], {
+            env,
+            stdio: ['ignore', 'inherit', 'inherit'],
+          });
+          if ((commitResult.status ?? 0) !== 0) {
+            console.error(`[mirror ${mirror.remote}] failed to commit the regenerate-only range output; halting.`);
+            return 1;
+          }
         }
       }
       // Count what we applied vs skipped.

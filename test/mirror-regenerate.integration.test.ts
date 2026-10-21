@@ -147,6 +147,60 @@ describe('regenerate on a clean range', () => {
     expect(code).toBe(0);
     expect(readFileSync(join(local, 'bun.lock'), 'utf8')).toBe(preBun);
   });
+
+  test('a commit that touches ONLY a regenerate path gets its own commit; the existing HEAD is not amended', async () => {
+    // Upstream changes nothing but bun.lock: the patch is empty, so no commit is
+    // applied. The regen output must land as a NEW commit carrying the source
+    // commit's metadata, never folded into a target commit this run did not create.
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock\n');
+    git(seed, 'add', '-A');
+    spawnSync('git', ['commit', '-q', '-m', 'deps: bump lock only'], {
+      cwd: seed,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'Source Author',
+        GIT_AUTHOR_EMAIL: 'source@example.com',
+        GIT_AUTHOR_DATE: '2026-01-02T03:04:05Z',
+        GIT_COMMITTER_NAME: 'Source Author',
+        GIT_COMMITTER_EMAIL: 'source@example.com',
+        GIT_COMMITTER_DATE: '2026-01-02T03:04:05Z',
+      },
+    });
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    const headBefore = git(local, 'rev-parse', 'HEAD');
+    setRegenerateCommand("printf 'local-regenerated\\n' > bun.lock");
+
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0);
+
+    expect(git(local, 'rev-parse', 'HEAD~1')).toBe(headBefore);
+    expect(git(local, 'show', '-s', '--format=%s|%an|%ae|%aI|%cn', 'HEAD')).toBe(
+      'deps: bump lock only|Source Author|source@example.com|2026-01-02T03:04:05Z|Source Author',
+    );
+    expect(git(local, 'show', 'HEAD:bun.lock')).toBe('local-regenerated');
+    expect(git(local, 'show', '--name-only', '--format=', 'HEAD')).toBe('bun.lock');
+    expect(git(local, 'show', 'HEAD~1:bun.lock')).toBe('stale');
+  });
+
+  test('a regenerate-only commit whose regen output is unchanged creates no commit', async () => {
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'deps: bump lock only');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    const headBefore = git(local, 'rev-parse', 'HEAD');
+    setRegenerateCommand("printf 'stale\\n' > bun.lock");
+
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(0);
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+    expect(git(local, 'rev-parse', TRACKING)).toBe(git(local, 'rev-parse', 'upstream/main'));
+  });
 });
 
 describe('regenerate on a partial (sub-case B)', () => {
@@ -191,6 +245,24 @@ describe('regenerate on a partial (sub-case B)', () => {
 });
 
 describe('regenerate error propagation (v0.5.9)', () => {
+  test('regenerate-only range: regen failure halts with code 1, creates nothing, and leaves tracking for a retry', async () => {
+    const seed = join(root, 'seed');
+    writeFileSync(join(seed, 'bun.lock'), 'upstream-lock\n');
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', 'deps: bump lock only');
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(local, 'fetch', '-q', 'upstream');
+
+    const headBefore = git(local, 'rev-parse', 'HEAD');
+    const trackingBefore = git(local, 'rev-parse', TRACKING);
+    setRegenerateCommand('exit 42');
+
+    const code = await mirrorPull({ remote: 'upstream' });
+    expect(code).toBe(1);
+    expect(git(local, 'rev-parse', 'HEAD')).toBe(headBefore);
+    expect(git(local, 'rev-parse', TRACKING)).toBe(trackingBefore);
+  });
+
   test('range: regen command non-zero exit HALTS the pull with code 1', async () => {
     const seed = join(root, 'seed');
     writeFileSync(join(seed, 'packages/cli/a.ts'), 'v2\n');
